@@ -254,15 +254,15 @@ gemm_config_t *setup_gemm_config_onednn(
   // Create oneDNN brgemm kernel
   dnnl::memory::data_type a_dt = dnnl::memory::data_type::bf16;
   dnnl::memory::data_type b_dt = dnnl::memory::data_type::bf16;
-  dnnl::memory::data_type c_dt = dnnl::memory::data_type::f32;
+  dnnl::memory::data_type c_dt = dnnl::memory::data_type::bf16;
 
-  const dnnl::memory::dim lda = bm; // VNNI-packed A (weights) leading dim
-  const dnnl::memory::dim ldb = bk; // B (activations) leading dim
+  const dnnl::memory::dim lda = bk; // A (activations) leading dim
+  const dnnl::memory::dim ldb = bm; // VNNI - packed B(weights) leading dim
   const dnnl::memory::dim ldc = bm; // Local C buffer leading dimension
   const dnnl::memory::dim ldd = bm; // D (BF16 output) leading dimension
 
   // Allocate oneDNN brgemm kernel on heap (must persist beyond setup)
-  dnnl::ukernel::brgemm *brgemm_onednn = new dnnl::ukernel::brgemm(bm, bn, bk, brcount, lda, ldb, ldc, a_dt, b_dt, c_dt, true);
+  dnnl::ukernel::brgemm *brgemm_onednn = new dnnl::ukernel::brgemm(bn, bm, bk, brcount, lda, ldb, ldc, a_dt, b_dt, c_dt, true);
 
   if (!(*brgemm_onednn))
   {
@@ -273,7 +273,7 @@ gemm_config_t *setup_gemm_config_onednn(
   }
 
   // Create post-ops: convert F32->BF16, then binary add with destination
-  dnnl::memory::dims binary_add_dims = {bm, bn};
+  dnnl::memory::dims binary_add_dims = {bn, bm};
   auto binary_add_md = dnnl::memory::desc(binary_add_dims, dnnl::memory::data_type::bf16, {ldd, 1});
 
   dnnl::post_ops brgemm_po;
@@ -306,8 +306,8 @@ gemm_config_t *setup_gemm_config_onednn(
     const size_t b_dt_size = sizeof(DType);
     for (dnnl::memory::dim br = 0; br < brcount; br++)
     {
-      const dnnl::memory::dim A_offset_br = br * bk * bm * a_dt_size;
-      const dnnl::memory::dim B_offset_br = br * bk * bn * b_dt_size;
+      const dnnl::memory::dim A_offset_br = br * bk * bn * a_dt_size;
+      const dnnl::memory::dim B_offset_br = br * bk * bm * b_dt_size;
       (*tl_offsets_array[0][t])[br] = std::make_pair(A_offset_br, B_offset_br);
     }
   }
