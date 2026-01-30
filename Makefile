@@ -42,17 +42,29 @@ LDFLAGS = -Wl,-rpath,'$(LIBXSMM_ROOT)/lib'
 IFLAGS = -I$(LIBXSMM_ROOT)/include
 LFLAGS = -L$(LIBXSMM_ROOT)/lib
 
+# oneDNN paths - set ONEDNN_ROOT environment variable or adjust these paths
+# Example: export ONEDNN_ROOT=/path/to/onednn
+ONEDNN_ROOT ?= $(HOME)/onednn_2026/oneDNN
+ONEDNN_IFLAGS = -I$(ONEDNN_ROOT)/include -I$(ONEDNN_ROOT)/build/include
+ONEDNN_LFLAGS = -L$(ONEDNN_ROOT)/build/src
+ONEDNN_LDFLAGS = -Wl,-rpath,$(ONEDNN_ROOT)/build/src
+
 TARGET = sfc_ca_gemm
+TARGET_ONEDNN = sfc_ca_onednn_gemm
 SOURCES = sfc_ca_gemm.cpp
+SOURCES_ONEDNN = sfc_ca_onednn_gemm.cpp
 HEADERS = sfc_ca_gemm.hpp sfc_utils.h
 
 .PHONY: all
-all: $(TARGET)
+all: $(TARGET) $(TARGET_ONEDNN)
 
 $(TARGET): $(SOURCES) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(SOURCES) $(LFLAGS) $(LDFLAGS) -lxsmm -o $@
 
+$(TARGET_ONEDNN): $(SOURCES_ONEDNN) $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES_ONEDNN) $(LFLAGS) $(ONEDNN_LFLAGS) $(LDFLAGS) $(ONEDNN_LDFLAGS) -lxsmm -ldnnl -o $@
+
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) $(TARGET_ONEDNN) *.o
 
 .PHONY: all clean

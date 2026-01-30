@@ -12,6 +12,14 @@
 #ifndef SFC_CA_GEMM_HPP
 #define SFC_CA_GEMM_HPP
 
+// oneDNN ukernel API
+#ifndef DNNL_EXPERIMENTAL_UKERNEL
+#define DNNL_EXPERIMENTAL_UKERNEL
+#endif
+#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl_ukernel.hpp"
+#include <vector>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +97,10 @@ typedef struct
   libxsmm_tilecfgfunction tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel;
+  // oneDNN-specific fields
+  void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
+  size_t onednn_scratchpad_size;
+  void *onednn_A_B_offsets_ptrs;  // thread-local offset vectors
 } gemm_config_t;
 
 template <typename DType>
@@ -164,6 +176,142 @@ gemm_config_t *setup_gemm_config(
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype, dtype, LIBXSMM_DATATYPE_F32);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
+
+  return config;
+}
+
+// oneDNN-specific setup function
+template <typename DType>
+gemm_config_t *setup_gemm_config_onednn(
+    long M, long N, long K,
+    long bm, long bn, long bk,
+    long kbf, long K_layers)
+{
+  gemm_config_t *config = new gemm_config_t();
+  // Calculate derived parameters
+  long Mb = M / bm, Nb = N / bn, Kb = K / bk;
+  long brcount = (Kb / K_layers) / kbf;
+  while (Kb % K_layers != 0)
+  {
+    K_layers--;
+  }
+  while ((Kb / K_layers) % kbf != 0)
+  {
+    kbf--;
+  }
+  brcount = (Kb / K_layers) / kbf;
+
+  // Store basic parameters
+  config->M = M;
+  config->N = N;
+  config->K = K;
+  config->Mb = Mb;
+  config->Nb = Nb;
+  config->Kb = Kb;
+  config->bm = bm;
+  config->bn = bn;
+  config->bk = bk;
+  config->K_layers = K_layers;
+  config->brcount = brcount;
+
+  // Allocate output_partial scratch buffers for K_layers > 1
+  int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
+  DType *global_scratch = NULL;
+  DType **output_partial_array = (DType **)libxsmm_aligned_malloc(sizeof(DType *) * n_out_copies, ALIGNMENT_SIZE);
+  output_partial_array[0] = NULL;
+  if (K_layers > 1)
+  {
+    global_scratch = (DType *)libxsmm_aligned_malloc(M * N * sizeof(DType) * (K_layers - 1), ALIGNMENT_SIZE);
+    for (int i = 1; i < K_layers; i++)
+    {
+      output_partial_array[i - 1] = (DType *)global_scratch + (i - 1) * M * N;
+    }
+  }
+  config->gemm_scratch = (void *)output_partial_array;
+
+  // Create SFC index map
+  unsigned char *sfc_index_map = NULL;
+  unsigned int index_tsize = sfc_ca_gemm_fill_sfc_index_map(&sfc_index_map, Mb, Nb);
+  config->sfc_index_map = sfc_index_map;
+  config->index_tsize = index_tsize;
+
+  // Setup libxsmm TPP kernels for auxiliary operations (zero, add, reduce)
+  auto dtype = sfc_ca_gemm_get_libxsmm_dtype<DType>();
+  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype, dtype, dtype);
+  config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
+
+  // Tile config/release not needed for oneDNN\n  config->tileconfig_kernel = NULL;
+  config->tilerelease_kernel = NULL;
+
+  // LIBXSMM brgemm kernel not used (oneDNN replaces it)
+  config->brgemm_kernel = NULL;
+
+  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype, dtype, dtype, LIBXSMM_DATATYPE_F32);
+  config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
+  auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype, dtype, LIBXSMM_DATATYPE_F32);
+  config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
+
+  // Create oneDNN brgemm kernel
+  dnnl::memory::data_type a_dt = dnnl::memory::data_type::bf16;
+  dnnl::memory::data_type b_dt = dnnl::memory::data_type::bf16;
+  dnnl::memory::data_type c_dt = dnnl::memory::data_type::f32;
+
+  const dnnl::memory::dim lda = bm; // VNNI-packed A (weights) leading dim
+  const dnnl::memory::dim ldb = bk; // B (activations) leading dim
+  const dnnl::memory::dim ldc = bm; // Local C buffer leading dimension
+  const dnnl::memory::dim ldd = bm; // D (BF16 output) leading dimension
+
+  // Allocate oneDNN brgemm kernel on heap (must persist beyond setup)
+  dnnl::ukernel::brgemm *brgemm_onednn = new dnnl::ukernel::brgemm(bm, bn, bk, brcount, lda, ldb, ldc, a_dt, b_dt, c_dt, true);
+
+  if (!(*brgemm_onednn))
+  {
+    printf("Error: oneDNN brgemm object was not constructed.\n");
+    delete brgemm_onednn;
+    config->onednn_brgemm_kernel = NULL;
+    return config;
+  }
+
+  // Create post-ops: convert F32->BF16, then binary add with destination
+  dnnl::memory::dims binary_add_dims = {bm, bn};
+  auto binary_add_md = dnnl::memory::desc(binary_add_dims, dnnl::memory::data_type::bf16, {ldd, 1});
+
+  dnnl::post_ops brgemm_po;
+  brgemm_po.append_binary(dnnl::algorithm::binary_add, binary_add_md);
+
+  brgemm_onednn->set_post_ops(ldd, dnnl::memory::data_type::bf16, brgemm_po);
+
+  if (!brgemm_onednn->finalize())
+  {
+    printf("oneDNN brgemm kernel is not supported on this platform.\n");
+    delete brgemm_onednn;
+    config->onednn_brgemm_kernel = NULL;
+    return config;
+  }
+  brgemm_onednn->generate();
+
+  config->onednn_brgemm_kernel = (void *)brgemm_onednn;
+  config->onednn_scratchpad_size = brgemm_onednn->get_scratchpad_size();
+
+  // Create thread-local A_B_offsets buffers (one per thread)
+  int num_threads = omp_get_max_threads();
+  std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***tl_offsets_array =
+      new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> **[1];
+  tl_offsets_array[0] = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> *[num_threads];
+
+  for (int t = 0; t < num_threads; t++)
+  {
+    tl_offsets_array[0][t] = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>(brcount);
+    const size_t a_dt_size = sizeof(DType);
+    const size_t b_dt_size = sizeof(DType);
+    for (dnnl::memory::dim br = 0; br < brcount; br++)
+    {
+      const dnnl::memory::dim A_offset_br = br * bk * bm * a_dt_size;
+      const dnnl::memory::dim B_offset_br = br * bk * bn * b_dt_size;
+      (*tl_offsets_array[0][t])[br] = std::make_pair(A_offset_br, B_offset_br);
+    }
+  }
+  config->onednn_A_B_offsets_ptrs = (void *)tl_offsets_array;
 
   return config;
 }
