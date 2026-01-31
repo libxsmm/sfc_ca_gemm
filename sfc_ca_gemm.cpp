@@ -12,10 +12,11 @@
 #include "sfc_ca_gemm.hpp"
 
 template<typename DType>
-void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
+void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
+  using CType = typename output_type<DType>::type;
   long M = config->M, N = config->N, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb, bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
-  DType **scratch_C = (DType**)config->gemm_scratch;
+  CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
   unsigned int index_tsize = config->index_tsize;
   libxsmm_gemmfunction brgemm_kernel = config->brgemm_kernel;
@@ -38,8 +39,8 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
         gemm_param.op.tertiary = (void*)&brcount;
         gemm_param.a.primary = (void*)((DType*)A + i_m * K * bm + i_k * bk * bm + i_k_layer * (K/K_layers) * bm );
         gemm_param.b.primary = (void*)((DType*)B + i_n * K * bn + i_k * bk * bn + i_k_layer * (K/K_layers) * bn );
-        gemm_param.c.primary = (i_k_layer > 0) ? (void *)((DType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
-                                               : (void *)((DType *)C + i_n * M * bn + i_m * bn * bm);
+        gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
+                                               : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
         if ((i_k == 0) && (brcount != (Kb/K_layers))) {
           libxsmm_meltw_unary_param zero_param;
           zero_param.out.primary = (void*)gemm_param.c.primary;
@@ -57,19 +58,19 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
       sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_red, index_tsize);
       if (K_layers == 2) {
         libxsmm_meltw_binary_param add_param;
-        add_param.in0.primary  = (void*)((DType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-        add_param.in1.primary  = (void*)((DType*)C + i_n * M * bn + i_m * bn * bm );       
-        add_param.out.primary = (void*)((DType*)C + i_n * M * bn + i_m * bn * bm );
+        add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+        add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
+        add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
         l_add_kernel(&add_param);
       } else {
         libxsmm_meltw_binary_param add_param;
         libxsmm_meltw_unary_param reduce_param;
-        DType reduce_scratch[bm*bn];
-        reduce_param.in.primary = (void*)((DType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+        CType reduce_scratch[bm*bn];
+        reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
         reduce_param.out.primary  = (void*)reduce_scratch;
         add_param.in0.primary  = (void*)reduce_scratch;
-        add_param.in1.primary  = (void*)((DType*)C + i_n * M * bn + i_m * bn * bm );       
-        add_param.out.primary = (void*)((DType*)C + i_n * M * bn + i_m * bn * bm );
+        add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
+        add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
         l_reduce_kernel(&reduce_param);
         l_add_kernel(&add_param);
       }
@@ -79,9 +80,9 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
 }
 
 template<typename DType>
-void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **BC) {
+void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C) {
   for (int i = 0; i < n_layers; i++) {
-    run_gemm<DType>(config, A[i], BC[2*i], BC[2*i+1]);
+    run_gemm<DType>(config, A[i], B[i], C[i]);
   }
   return;
 }
@@ -135,23 +136,21 @@ int gemm_benchmark(int argc, char** argv) {
   }
   
   long Mb = M/bm, Nb = N/bn, Kb = K/bk;
+  using CType = typename output_type<DType>::type;
   // Allocate buffers
-  DType **BC = (DType**) malloc((2*n_layers)*sizeof(DType*));
-  check_null_ptr(BC, "BC array");
+  DType **B = (DType**) malloc(n_layers*sizeof(DType*));
+  check_null_ptr(B, "B array");
+  CType **C = (CType**) malloc(n_layers*sizeof(CType*));
+  check_null_ptr(C, "C array");
   DType **A = (DType**) malloc(n_layers    *sizeof(DType*));
   check_null_ptr(A, "A array");
   for (i = 0; i < n_layers; i++) {
     A[i] = (DType*) libxsmm_aligned_malloc(M*K*sizeof(DType), ALIGNMENT_SIZE);
-  }
-  for (i = 0; i < 2*n_layers; i++) {
-    if (i%2 == 0) {
-      // Allocate buffer for B
-      BC[i] = (DType*) libxsmm_aligned_malloc(K*N*sizeof(DType), ALIGNMENT_SIZE);
-    } else {
-      // Allocate buffer for C
-      BC[i] = (DType*) libxsmm_aligned_malloc(M*N*sizeof(DType), ALIGNMENT_SIZE);
-    }
-    check_null_ptr(BC[i], "BC[i] array"); 
+    B[i] = (DType*) libxsmm_aligned_malloc(K*N*sizeof(DType), ALIGNMENT_SIZE);
+    C[i] = (CType*) libxsmm_aligned_malloc(M*N*sizeof(CType), ALIGNMENT_SIZE);
+    check_null_ptr(A[i], "A[i] array");
+    check_null_ptr(B[i], "B[i] array");
+    check_null_ptr(C[i], "C[i] array");
   }
   
   // Allocate reference buffers
@@ -165,25 +164,37 @@ int gemm_benchmark(int argc, char** argv) {
   check_null_ptr(naive_a, "naive_a array");
   DType *naive_b_lp  = (DType*)libxsmm_aligned_malloc( K*N*sizeof(DType), ALIGNMENT_SIZE);
   check_null_ptr(naive_b_lp, "naive_b_lp array");
-  DType *naive_c_lp = (DType*)libxsmm_aligned_malloc( M*N*sizeof(DType), ALIGNMENT_SIZE);
+  CType *naive_c_lp = (CType*)libxsmm_aligned_malloc( M*N*sizeof(CType), ALIGNMENT_SIZE);
   check_null_ptr(naive_c_lp, "naive_c_lp array");
   DType *naive_a_lp = (DType*)libxsmm_aligned_malloc( M*K*sizeof(DType), ALIGNMENT_SIZE);
   check_null_ptr(naive_a_lp, "naive_a_lp array");
   
-  // Init buffers
-  init_buf( naive_b,    K*N, 0, 0 );
-  init_buf( naive_c,    M*N, 0, 0 );
-  init_buf( naive_a,    M*K, 0, 0 );
-  sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_b,     (void*)naive_b_lp,     N*K);
-  sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_b_lp, naive_b, N*K);
-  sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_c,    (void*)naive_c_lp,    N*M);
-  sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_c_lp, naive_c, N*M);
-  sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_a,    (void*)naive_a_lp,    M*K);
-  sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_a_lp, naive_a, M*K);
+  // Init buffers - for I8, initialize directly; for others, use float conversion
+  if (std::is_same<DType, char>::value) {
+    // Direct I8 initialization
+    init_buf_int((char*)naive_a_lp, M*K, -128, 127);
+    init_buf_int((char*)naive_b_lp, K*N, -128, 127);
+    init_buf_int((int*)naive_c_lp, M*N, -1000000, 1000000);
+    // Convert to float for reference computation
+    sfc_ca_gemm_convert_lp_f32<DType>((void*)naive_a_lp, naive_a, M*K);
+    sfc_ca_gemm_convert_lp_f32<DType>((void*)naive_b_lp, naive_b, N*K);
+    sfc_ca_gemm_convert_lp_f32<CType>((void*)naive_c_lp, naive_c, N*M);
+  } else {
+    // Original float-based initialization for BF16/FP32
+    init_buf( naive_b,    K*N, 0, 0 );
+    init_buf( naive_c,    M*N, 0, 0 );
+    init_buf( naive_a,    M*K, 0, 0 );
+    sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_b,     (void*)naive_b_lp,     N*K);
+    sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_b_lp, naive_b, N*K);
+    sfc_ca_gemm_rne_convert_fp32_lp<CType>( naive_c,    (void*)naive_c_lp,    N*M);
+    sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c, N*M);
+    sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_a,    (void*)naive_a_lp,    M*K);
+    sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_a_lp, naive_a, M*K);
+  }
   for (i = 0; i < n_layers; i++) {
     sfc_ca_gemm_matrix_copy_KC_to_KCCK<DType>( (void*)naive_a_lp, (void*)A[i], K, M, bk, bm);
-    sfc_ca_gemm_matrix_copy_NC_to_NCNC<DType>( (void*)naive_b_lp, (void*)BC[2*i] , N, K, bn, bk);
-    sfc_ca_gemm_matrix_copy_NC_to_NCNC<DType>( (void*)naive_c_lp, (void*)BC[2*i+1], N, M, bn, bm);
+    sfc_ca_gemm_matrix_copy_NC_to_NCNC<DType>( (void*)naive_b_lp, (void*)B[i] , N, K, bn, bk);
+    sfc_ca_gemm_matrix_copy_NC_to_NCNC<CType>( (void*)naive_c_lp, (void*)C[i], N, M, bn, bm);
   }
   
   // Compute reference if requested
@@ -194,15 +205,15 @@ int gemm_benchmark(int argc, char** argv) {
     naive_param.M = M;
     naive_param.fuse_type = 0;
     naive_gemm_fp(&naive_param, naive_b, naive_c, naive_a);
-    sfc_ca_gemm_rne_convert_fp32_lp<DType>( naive_c,     (void*)naive_c_lp, (N*M) );
-    sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_c_lp, naive_c, N*M);
+    sfc_ca_gemm_rne_convert_fp32_lp<CType>( naive_c,     (void*)naive_c_lp, (N*M) );
+    sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c, N*M);
   } 
   
   // Setup GEMM configuration
   gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers);
 
   // Warmup iteration
-  run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, BC);
+  run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
 
   // Check correctness if requested
   printf("##############################################################\n");
@@ -213,8 +224,8 @@ int gemm_benchmark(int argc, char** argv) {
     libxsmm_matdiff_info norms, diff;
     libxsmm_matdiff_clear(&norms);
     libxsmm_matdiff_clear(&diff);
-    sfc_ca_gemm_matrix_copy_NCNC_to_NC<DType>( (void*)BC[2*n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
-    sfc_ca_gemm_convert_lp_f32<DType>( (void*)naive_c_lp, naive_c_opt, N*M );
+    sfc_ca_gemm_matrix_copy_NCNC_to_NC<CType>( (void*)C[n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
+    sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c_opt, N*M );
     printf("##########################################\n");
     printf("#           Correctness                  #\n");
     printf("##########################################\n");
@@ -232,7 +243,7 @@ int gemm_benchmark(int argc, char** argv) {
   // benchmark the GEMM
   auto t_start = getTime();
   for (long it = 0; it < n_iters; it++) {
-    run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, BC);
+    run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
   }
   auto t_end = getTime();
 
@@ -242,7 +253,7 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective model sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
   printf("Effective total GEMM sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*((double)M*(double)K + (double)M*(double)N + (double)K*(double)N ))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
-  printf("MEASURE %.5g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
+  printf("MEASURE %.6g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
 
   // Free buffers
   libxsmm_free(naive_b);
@@ -254,21 +265,21 @@ int gemm_benchmark(int argc, char** argv) {
   libxsmm_free(naive_a_lp);
   for (i = 0; i < n_layers; i++) {
     libxsmm_free(A[i]);
-  }
-  for (i = 0; i < 2*n_layers; i++) {
-    libxsmm_free(BC[i]);
+    libxsmm_free(B[i]);
+    libxsmm_free(C[i]);
   }
   // Free config buffers
   if (gemm_cfg->sfc_index_map != NULL) {
     libxsmm_free(gemm_cfg->sfc_index_map);
   }
 
-  DType **output_partial_array = (DType**)gemm_cfg->gemm_scratch;
+  CType **output_partial_array = (CType**)gemm_cfg->gemm_scratch;
   if (output_partial_array[0] != NULL)
   {
     libxsmm_free(output_partial_array[0]);
   }
-  free(BC);
+  free(B);
+  free(C);
   free(A);
   libxsmm_free(gemm_cfg->gemm_scratch);
   delete gemm_cfg;
@@ -287,6 +298,9 @@ int main(int argc, char** argv) {
     if (strcmp(argv[12],"FP32") == 0) {
       use_dtype = 3;
     }
+    if (strcmp(argv[12],"I8") == 0) {
+      use_dtype = 4;
+    }
   }
   if (use_dtype == 1) {
     return gemm_benchmark<libxsmm_bfloat16>(argc, argv);  
@@ -294,6 +308,8 @@ int main(int argc, char** argv) {
     return gemm_benchmark<libxsmm_bfloat8>(argc, argv);
   } else if (use_dtype == 3) {
     return gemm_benchmark<float>(argc, argv);
+  } else if (use_dtype == 4) {
+    return gemm_benchmark<char>(argc, argv);
   } else {
     return 0;
   }

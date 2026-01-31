@@ -35,6 +35,10 @@
 template<typename DType> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype();
 unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb);
 
+// Type trait to determine output type (INT32 for INT8 input, same as input otherwise)
+template<typename DType> struct output_type { using type = DType; };
+template<> struct output_type<char> { using type = int; };
+
 // Timing utilities
 double ifreq;
 
@@ -137,16 +141,17 @@ gemm_config_t *setup_gemm_config(
   config->brcount = brcount;
 
   // Allocate output_partial scratch buffers for K_layers > 1
+  using CType = typename output_type<DType>::type;
   int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
-  DType *global_scratch = NULL;
-  DType **output_partial_array = (DType**)libxsmm_aligned_malloc(sizeof(DType*) * n_out_copies, ALIGNMENT_SIZE);
+  CType *global_scratch = NULL;
+  CType **output_partial_array = (CType**)libxsmm_aligned_malloc(sizeof(CType*) * n_out_copies, ALIGNMENT_SIZE);
   output_partial_array[0] = NULL;
   if (K_layers > 1)
   {
-    global_scratch = (DType *)libxsmm_aligned_malloc(M * N * sizeof(DType) * (K_layers - 1), ALIGNMENT_SIZE);
+    global_scratch = (CType *)libxsmm_aligned_malloc(M * N * sizeof(CType) * (K_layers - 1), ALIGNMENT_SIZE);
     for (int i = 1; i < K_layers; i++)
     {
-      output_partial_array[i - 1] = (DType *)global_scratch + (i - 1) * M * N;
+      output_partial_array[i - 1] = (CType *)global_scratch + (i - 1) * M * N;
     }
   }
   config->gemm_scratch = (void *)output_partial_array;
@@ -159,22 +164,25 @@ gemm_config_t *setup_gemm_config(
 
   // Setup TPP kernels
   auto dtype = sfc_ca_gemm_get_libxsmm_dtype<DType>();
+  auto dtype_out = sfc_ca_gemm_get_libxsmm_dtype<CType>();
+  // Computation type: I32 for I8 inputs, F32 for BF16/FP32
+  auto dtype_comp = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_I32 : LIBXSMM_DATATYPE_F32;
   auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
-  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype, LIBXSMM_DATATYPE_F32);
+  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_out, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), bk * bn * sizeof(DType), brcount);
-  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype, dtype, dtype);
+  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_comp);
   if (brcount == (Kb / K_layers))
     l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
-  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype, dtype, dtype, LIBXSMM_DATATYPE_F32);
+  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_out, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
-  auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype, dtype, LIBXSMM_DATATYPE_F32);
+  auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype_out, dtype_out, dtype_comp);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
 
   return config;
@@ -342,6 +350,14 @@ template<> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype<libxsmm_bfloat8>() {
   return LIBXSMM_DATATYPE_BF8;
 }
 
+template<> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype<char>() {
+  return LIBXSMM_DATATYPE_I8;
+}
+
+template<> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype<int>() {
+  return LIBXSMM_DATATYPE_I32;
+}
+
 // Forward declaration of naive_fullyconnected struct
 typedef struct {
   long N;
@@ -467,6 +483,26 @@ template<> void sfc_ca_gemm_rne_convert_fp32_lp<libxsmm_bfloat8>(float *in, void
   return;
 }
 
+template<> void sfc_ca_gemm_rne_convert_fp32_lp<char>(float *in, void *out, long size) {
+  char *out_i8 = (char*)out;
+  for (long i = 0; i < size; i++) {
+    // Clamp to INT8 range [-128, 127]
+    float val = in[i];
+    if (val > 127.0f) val = 127.0f;
+    if (val < -128.0f) val = -128.0f;
+    out_i8[i] = (char)(val);
+  }
+  return;
+}
+
+template<> void sfc_ca_gemm_rne_convert_fp32_lp<int>(float *in, void *out, long size) {
+  int *out_i32 = (int*)out;
+  for (long i = 0; i < size; i++) {
+    out_i32[i] = (int)(in[i]);
+  }
+  return;
+}
+
 template<typename DType> void sfc_ca_gemm_convert_lp_f32(void *in, float *out, long size) {
   libxsmm_convert_bf16_f32((libxsmm_bfloat16*)in, out, size);
   return;
@@ -484,6 +520,30 @@ template<> void sfc_ca_gemm_convert_lp_f32<libxsmm_bfloat16>(void *in, float *ou
 
 template<> void sfc_ca_gemm_convert_lp_f32<libxsmm_bfloat8>(void *in, float *out, long size) {
   libxsmm_convert_bf8_f32((libxsmm_bfloat8*)in, out, size);
+  return;
+}
+
+template<> void sfc_ca_gemm_convert_lp_f32<char>(void *in, float *out, long size) {
+  char *in_i8 = (char*)in;
+  for (long i = 0; i < size; i++) {
+    out[i] = (float)in_i8[i];
+  }
+  return;
+}
+
+// Direct random initialization for I8 and I32 (no float conversion)
+template<typename T>
+void init_buf_int(T *buf, long size, int range_min, int range_max) {
+  for (long i = 0; i < size; i++) {
+    buf[i] = (T)(rand() % (range_max - range_min + 1) + range_min);
+  }
+}
+
+template<> void sfc_ca_gemm_convert_lp_f32<int>(void *in, float *out, long size) {
+  int *in_i32 = (int*)in;
+  for (long i = 0; i < size; i++) {
+    out[i] = (float)in_i32[i];
+  }
   return;
 }
 

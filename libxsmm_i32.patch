@@ -1,0 +1,472 @@
+diff --git a/samples/eltwise/eltwise_binary_simple.c b/samples/eltwise/eltwise_binary_simple.c
+index 549cab0a2..f0d38ab7d 100644
+--- a/samples/eltwise/eltwise_binary_simple.c
++++ b/samples/eltwise/eltwise_binary_simple.c
+@@ -494,6 +494,24 @@ void binary_op_gold(const libxsmm_blasint M, const libxsmm_blasint N, const libx
+         d_out[(j*ldo) + i] = out_value;
+       }
+     }
++  } else if ( dtype_comp == LIBXSMM_DATATYPE_I32 ) {
++    /* INT32 binary operations */
++    const int* i32_in0 = (const int*)in0;
++    const int* i32_in1 = (const int*)in1;
++    int* i32_out = (int*)out;
++    for ( j = 0; j < N; ++j ) {
++      for ( i = 0; i < M; ++i ) {
++        int in0_value = i32_in0[(j*ldi0) + i];
++        int in1_value = i32_in1[(j*ldi1) + i];
++        /* Only ADD operation supported for INT32 */
++        if (op == ADD_OP) {
++          i32_out[(j*ldo) + i] = in0_value + in1_value;
++        } else {
++          /* should not happen for INT32 */
++          i32_out[(j*ldo) + i] = in0_value + in1_value;
++        }
++      }
++    }
+   } else {
+     /* should not happen */
+   }
+@@ -669,7 +687,29 @@ int test_binary_op( const libxsmm_blasint M, const libxsmm_blasint N, const libx
+   printf("Linf rel.error: %.24f\n", norms_out.linf_rel);
+   printf("Check-norm    : %.24f\n\n", norms_out.normf_rel);
+ 
+-  if ( (op == MULADD_OP) && ((dtype_out == LIBXSMM_DATATYPE_BF16) || (dtype_out == LIBXSMM_DATATYPE_F16)) ) {
++  /* For integer types, check for exact bitwise equality */
++  if ( (dtype_out == LIBXSMM_DATATYPE_I32) || (dtype_out == LIBXSMM_DATATYPE_U32) ||
++       (dtype_out == LIBXSMM_DATATYPE_I16) || (dtype_out == LIBXSMM_DATATYPE_U16) ||
++       (dtype_out == LIBXSMM_DATATYPE_I8) ) {
++    /* Manual exact comparison for integers */
++    libxsmm_blasint errors = 0;
++    if (dtype_out == LIBXSMM_DATATYPE_I32 || dtype_out == LIBXSMM_DATATYPE_U32) {
++      const int* gold_i32 = (const int*)out_gold;
++      const int* test_i32 = (const int*)out;
++      for (libxsmm_blasint j = 0; j < N; j++) {
++        for (libxsmm_blasint i = 0; i < M; i++) {
++          if (gold_i32[j*l_ldo + i] != test_i32[j*l_ldo + i]) {
++            errors++;
++          }
++        }
++      }
++    }
++    if (errors > 0) {
++      ret = EXIT_FAILURE;
++    } else {
++      ret = EXIT_SUCCESS;
++    }
++  } else if ( (op == MULADD_OP) && ((dtype_out == LIBXSMM_DATATYPE_BF16) || (dtype_out == LIBXSMM_DATATYPE_F16)) ) {
+     if ( norms_out.normf_rel > 0.001 ) {
+       ret = EXIT_FAILURE;
+     }
+@@ -847,7 +887,9 @@ int main( int argc, char* argv[] ) {
+          ( (dtype_in0 == LIBXSMM_DATATYPE_HF8 ) && (dtype_in1 == LIBXSMM_DATATYPE_F32 ) && (dtype_out == LIBXSMM_DATATYPE_F32 ) && (dtype_comp == LIBXSMM_DATATYPE_F32 ) ) ||
+          ( (dtype_in0 == LIBXSMM_DATATYPE_HF8 ) && (dtype_in1 == LIBXSMM_DATATYPE_F32 ) && (dtype_out == LIBXSMM_DATATYPE_HF8 ) && (dtype_comp == LIBXSMM_DATATYPE_F32 ) ) ||
+          ( (dtype_in0 == LIBXSMM_DATATYPE_HF8 ) && (dtype_in1 == LIBXSMM_DATATYPE_HF8 ) && (dtype_out == LIBXSMM_DATATYPE_F32 ) && (dtype_comp == LIBXSMM_DATATYPE_F32 ) ) ||
+-         ( (dtype_in0 == LIBXSMM_DATATYPE_HF8 ) && (dtype_in1 == LIBXSMM_DATATYPE_HF8 ) && (dtype_out == LIBXSMM_DATATYPE_HF8 ) && (dtype_comp == LIBXSMM_DATATYPE_F32 ) ) ) ){
++         ( (dtype_in0 == LIBXSMM_DATATYPE_HF8 ) && (dtype_in1 == LIBXSMM_DATATYPE_HF8 ) && (dtype_out == LIBXSMM_DATATYPE_HF8 ) && (dtype_comp == LIBXSMM_DATATYPE_F32 ) ) ||
++         /* INT32 - only ADD op supported */
++         ( (dtype_in0 == LIBXSMM_DATATYPE_I32 ) && (dtype_in1 == LIBXSMM_DATATYPE_I32 ) && (dtype_out == LIBXSMM_DATATYPE_I32 ) && (dtype_comp == LIBXSMM_DATATYPE_I32 ) && (op == ADD_OP) ) ) ){
+       printf("Testing binary (in0:%s in1:%s out:%s comp:%s) %s - M=%i, N=%i, LDI=%i, LDO=%i\n",
+         libxsmm_get_typename(dtype_in0), libxsmm_get_typename(dtype_in1), libxsmm_get_typename(dtype_out), libxsmm_get_typename(dtype_comp), opname, M, N, ldi, ldo);
+       res = test_binary_op( M, N, ldi, ldo, op, use_bcast, dtype_in0, dtype_in1, dtype_out, dtype_comp, rnd_mode);
+diff --git a/samples/eltwise/eltwise_unary_reduce.c b/samples/eltwise/eltwise_unary_reduce.c
+index fc7f6d719..379da0c19 100644
+--- a/samples/eltwise/eltwise_unary_reduce.c
++++ b/samples/eltwise/eltwise_unary_reduce.c
+@@ -140,6 +140,60 @@ void reference_reduce_kernel_f64( libxsmm_blasint m, libxsmm_blasint n, libxsmm_
+   }
+ }
+ 
++LIBXSMM_INLINE
++void reference_reduce_kernel_i32( libxsmm_blasint m, libxsmm_blasint n, libxsmm_blasint ld_in, libxsmm_blasint n_cols_idx,
++                              int *sinp, int *ref_result_reduce_elts, int *ref_result_reduce_elts_squared, unsigned long long *cols_ind_array,
++                              unsigned int reduce_op, unsigned int reduce_rows,
++                              unsigned int record_idx, unsigned long long *ref_argop_off, libxsmm_datatype dtype, unsigned int reduce_on_output ) {
++  libxsmm_blasint i = 0, j = 0, jj = 0;
++  LIBXSMM_UNUSED(dtype);
++  LIBXSMM_UNUSED(record_idx);
++  LIBXSMM_UNUSED(ref_argop_off);
++  
++  if (reduce_op == 0) {
++    /* Calculate reference results for INT32 ADD reduction... */
++    if (reduce_rows == 1) {
++      for (j = 0; j < n; j++) {
++        if ( reduce_on_output == 0 ) {
++          ref_result_reduce_elts[j] = 0;
++          ref_result_reduce_elts_squared[j] = 0;
++        }
++        for (i = 0; i < m; i++) {
++          ref_result_reduce_elts[j] += sinp[j*ld_in + i];
++          ref_result_reduce_elts_squared[j] += sinp[j*ld_in + i] * sinp[j*ld_in + i];
++        }
++      }
++    } else {
++      if (n_cols_idx == 0) {
++        /* In this case we reduce columns */
++        for (i = 0; i < m; i++) {
++          if ( reduce_on_output == 0 ) {
++            ref_result_reduce_elts[i] = 0;
++            ref_result_reduce_elts_squared[i] = 0;
++          }
++          for (j = 0; j < n; j++) {
++            ref_result_reduce_elts[i] += sinp[j*ld_in + i];
++            ref_result_reduce_elts_squared[i] += sinp[j*ld_in + i] * sinp[j*ld_in + i];
++          }
++        }
++      } else {
++        for (i = 0; i < m; i++) {
++          if ( reduce_on_output == 0 ) {
++            ref_result_reduce_elts[i] = 0;
++          }
++          for (jj = 0; jj < n_cols_idx; jj++) {
++            j = (libxsmm_blasint)cols_ind_array[jj];
++            ref_result_reduce_elts[i] += sinp[j*ld_in + i];
++          }
++        }
++      }
++    }
++  } else {
++    /* MAX/MIN not supported for INT32 in this test */
++    printf("Only ADD reduction supported for INT32\n");
++  }
++}
++
+ LIBXSMM_INLINE
+ void reference_reduce_kernel( libxsmm_blasint m, libxsmm_blasint n, libxsmm_blasint ld_in, libxsmm_blasint n_cols_idx,
+                               float *sinp, float *ref_result_reduce_elts, float *ref_result_reduce_elts_squared, unsigned long long *cols_ind_array,
+@@ -383,6 +437,8 @@ void setup_tpp_kernel_and_param_struct( libxsmm_meltwfunction_unary *res_kernel,
+ #endif
+   if (dtype == LIBXSMM_DATATYPE_F64) {
+     unary_shape.comp_type = LIBXSMM_DATATYPE_F64;
++  } else if (dtype == LIBXSMM_DATATYPE_I32) {
++    unary_shape.comp_type = LIBXSMM_DATATYPE_I32;
+   } else {
+     unary_shape.comp_type = LIBXSMM_DATATYPE_F32;
+   }
+@@ -455,7 +511,7 @@ void setup_tpp_kernel_and_param_struct( libxsmm_meltwfunction_unary *res_kernel,
+   }
+ 
+   /* Setup param struct */
+-  if (dtype == LIBXSMM_DATATYPE_F32 || dtype == LIBXSMM_DATATYPE_F64) {
++  if (dtype == LIBXSMM_DATATYPE_F32 || dtype == LIBXSMM_DATATYPE_F64 || dtype == LIBXSMM_DATATYPE_I32) {
+     unary_param.in.primary = sinp;
+     unary_param.out.primary = result_reduce_elts;
+   } else {
+@@ -466,7 +522,7 @@ void setup_tpp_kernel_and_param_struct( libxsmm_meltwfunction_unary *res_kernel,
+   params2.in.primary  = sinp_hp;
+   params2.out.primary = result_reduce_elts_hp;
+ #else
+-  if (dtype == LIBXSMM_DATATYPE_F32) {
++  if (dtype == LIBXSMM_DATATYPE_F32 || dtype == LIBXSMM_DATATYPE_I32) {
+     params2.in.primary  = sinp;
+     params2.out.primary  = result_reduce_elts;
+   } else {
+@@ -495,6 +551,7 @@ int main(int argc, char* argv[])
+   libxsmm_blasint ld_in = 64/*, ld_out = 64*/;
+   float  *sinp = NULL, *result_reduce_elts = NULL, *result_reduce_elts_squared = NULL, *ref_result_reduce_elts = NULL, *ref_result_reduce_elts_squared = NULL;
+   double *dinp = NULL, *d_result_reduce_elts = NULL, *d_result_reduce_elts_squared = NULL, *d_ref_result_reduce_elts = NULL, *d_ref_result_reduce_elts_squared = NULL;
++  int *iinp = NULL, *i_result_reduce_elts = NULL, *i_result_reduce_elts_squared = NULL, *i_ref_result_reduce_elts = NULL, *i_ref_result_reduce_elts_squared = NULL;
+   unsigned long long *ref_argop_off = NULL, *argop_off = NULL;
+   unsigned int *ref_argop_off_i32 = NULL, *argop_off_i32 = NULL;
+   char *sinp_lp = NULL;
+@@ -554,16 +611,19 @@ int main(int argc, char* argv[])
+        (dtype != LIBXSMM_DATATYPE_F16)  &&
+        (dtype != LIBXSMM_DATATYPE_BF16) &&
+        (dtype != LIBXSMM_DATATYPE_BF8)  &&
+-       (dtype != LIBXSMM_DATATYPE_HF8) ) {
+-    printf("Only F32,F64,BF16,F16,BF8,HF8 are supported datatypes\n");
++       (dtype != LIBXSMM_DATATYPE_HF8)  &&
++       (dtype != LIBXSMM_DATATYPE_I32) ) {
++    printf("Only F32,F64,BF16,F16,BF8,HF8,I32 are supported datatypes\n");
+     exit(EXIT_FAILURE);
+   }
+ 
+   /* Allocate arrays */
+   sinp  = (float*) malloc( sizeof(float)*ld_in*n );
+   dinp  = (double*) malloc( sizeof(double)*ld_in*n );
++  iinp  = (int*) malloc( sizeof(int)*ld_in*n );
+   result_reduce_elts = (float*) malloc( sizeof(float)*result_size*2 );
+   d_result_reduce_elts = (double*) malloc( sizeof(double)*result_size*2 );
++  i_result_reduce_elts = (int*) malloc( sizeof(int)*result_size*2 );
+   /* Fill matrices with random data */
+   sfill_matrix ( sinp, ld_in, m, n );
+   if (reduce_on_outputs > 0) {
+@@ -571,14 +631,20 @@ int main(int argc, char* argv[])
+   }
+   for ( k = 0; k < ld_in * n; k++) {
+     dinp[k] = (double) sinp[k];
++    /* Scale float values to get reasonable integer values in range [-100, 100] */
++    iinp[k] = (int) (sinp[k] * 100.0f);
+   }
+   for ( k = 0; k < result_size*2; k++) {
+     d_result_reduce_elts[k] = (double) result_reduce_elts[k];
++    /* Scale float values to get reasonable integer values in range [-100, 100] */
++    i_result_reduce_elts[k] = (int) (result_reduce_elts[k] * 100.0f);
+   }
+   ref_result_reduce_elts = (float*) malloc(result_size*sizeof(float) );
+   ref_result_reduce_elts_squared = (float*) malloc(result_size*sizeof(float) );
+   d_ref_result_reduce_elts = (double*) malloc(result_size*sizeof(double) );
+   d_ref_result_reduce_elts_squared = (double*) malloc(result_size*sizeof(double) );
++  i_ref_result_reduce_elts = (int*) malloc(result_size*sizeof(int) );
++  i_ref_result_reduce_elts_squared = (int*) malloc(result_size*sizeof(int) );
+ 
+   if (dtype == LIBXSMM_DATATYPE_BF16) {
+     sinp_lp  = (char*) malloc( sizeof(libxsmm_bfloat16)*ld_in*n );
+@@ -637,6 +703,7 @@ int main(int argc, char* argv[])
+     if (reduce_elts == 1) {
+       result_reduce_elts_squared = (float*) result_reduce_elts + result_size;
+       d_result_reduce_elts_squared = (double*) d_result_reduce_elts + result_size;
++      i_result_reduce_elts_squared = (int*) i_result_reduce_elts + result_size;
+       if (dtype == LIBXSMM_DATATYPE_BF16) {
+         result_reduce_elts_squared_lp = (char*)((libxsmm_bfloat16*) result_reduce_elts_lp + result_size);
+         /* TODO: this needs clean-up */
+@@ -665,11 +732,16 @@ int main(int argc, char* argv[])
+         /* TODO: this needs clean-up */
+         memcpy( (void*)d_ref_result_reduce_elts, (void*)d_result_reduce_elts, sizeof(double)*result_size );
+         memcpy( (void*)d_ref_result_reduce_elts_squared, (void*)d_result_reduce_elts_squared, sizeof(double)*result_size );
++      } else if (dtype == LIBXSMM_DATATYPE_I32) {
++        i_result_reduce_elts_squared = (int*) i_result_reduce_elts + result_size;
++        memcpy( (void*)i_ref_result_reduce_elts, (void*)i_result_reduce_elts, sizeof(int)*result_size );
++        memcpy( (void*)i_ref_result_reduce_elts_squared, (void*)i_result_reduce_elts_squared, sizeof(int)*result_size );
+       }
+     }
+     if ((reduce_elts == 0) && (reduce_elts_squared == 1)) {
+       result_reduce_elts_squared = (float*) result_reduce_elts;
+       d_result_reduce_elts_squared = (double*) d_result_reduce_elts;
++      i_result_reduce_elts_squared = (int*) i_result_reduce_elts;
+       if (dtype == LIBXSMM_DATATYPE_BF16) {
+         result_reduce_elts_squared_lp = result_reduce_elts_lp;
+         /* TODO: this needs clean-up */
+@@ -690,6 +762,8 @@ int main(int argc, char* argv[])
+         memcpy( (void*)ref_result_reduce_elts_squared, (void*)result_reduce_elts_squared, sizeof(float)*result_size );
+       } else if (dtype == LIBXSMM_DATATYPE_F64) {
+         memcpy( (void*)d_ref_result_reduce_elts_squared, (void*)d_result_reduce_elts_squared, sizeof(double)*result_size );
++      } else if (dtype == LIBXSMM_DATATYPE_I32) {
++        memcpy( (void*)i_ref_result_reduce_elts_squared, (void*)i_result_reduce_elts_squared, sizeof(int)*result_size );
+       }
+     }
+   }
+@@ -700,16 +774,27 @@ int main(int argc, char* argv[])
+     cols_ind_array_32bit[j] = (unsigned int) cols_ind_array[j];
+   }
+ 
++  /* Debug: print some input values for I32 */
++  if (dtype == LIBXSMM_DATATYPE_I32) {
++    printf("Debug I32 input values (first 10): ");
++    for (k = 0; k < 10 && k < ld_in * n; k++) {
++      printf("%d ", iinp[k]);
++    }
++    printf("\n");
++  }
++  
+   printf("Running reference reduce kernel... \n");
+   if (dtype == LIBXSMM_DATATYPE_F64) {
+     reference_reduce_kernel_f64( m, n, ld_in, (libxsmm_blasint)n_cols_idx, dinp, d_ref_result_reduce_elts, d_ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
++  } else if (dtype == LIBXSMM_DATATYPE_I32) {
++    reference_reduce_kernel_i32( m, n, ld_in, (libxsmm_blasint)n_cols_idx, iinp, i_ref_result_reduce_elts, i_ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
+   } else {
+     reference_reduce_kernel( m, n, ld_in, (libxsmm_blasint)n_cols_idx, sinp, ref_result_reduce_elts, ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
+   }
+ 
+   printf("JITing reduce kernel... \n");
+   setup_tpp_kernel_and_param_struct( &kernel, &kernel2, &unary_param, &params2, m, n, ld_in, (libxsmm_blasint)n_cols_idx, reduce_rows, reduce_op, reduce_elts, reduce_elts_squared, dtype, idx_type,
+-      (dtype == LIBXSMM_DATATYPE_F64) ? (float*)dinp : sinp, (dtype == LIBXSMM_DATATYPE_F64) ? (float*)d_result_reduce_elts : result_reduce_elts,
++      (dtype == LIBXSMM_DATATYPE_F64) ? (float*)dinp : ((dtype == LIBXSMM_DATATYPE_I32) ? (float*)iinp : sinp), (dtype == LIBXSMM_DATATYPE_F64) ? (float*)d_result_reduce_elts : ((dtype == LIBXSMM_DATATYPE_I32) ? (float*)i_result_reduce_elts : result_reduce_elts),
+       sinp_lp, result_reduce_elts_lp,
+       cols_ind_array, cols_ind_array_32bit,
+       record_idx, argop_off, argop_off_i32, reduce_on_outputs );
+@@ -724,6 +809,20 @@ int main(int argc, char* argv[])
+     kernel2( &params2 );
+   }
+ 
++  /* Debug: print reference and test results for I32 */
++  if (dtype == LIBXSMM_DATATYPE_I32) {
++    printf("Debug I32 reference results (first 5): ");
++    for (k = 0; k < 5 && k < result_size; k++) {
++      printf("%d ", i_ref_result_reduce_elts[k]);
++    }
++    printf("\n");
++    printf("Debug I32 test results (first 5): ");
++    for (k = 0; k < 5 && k < result_size; k++) {
++      printf("%d ", i_result_reduce_elts[k]);
++    }
++    printf("\n");
++  }
++
+   /* compare */
+   printf("##########################################\n");
+   if (n_cols_idx == 0) {
+@@ -737,6 +836,8 @@ int main(int argc, char* argv[])
+       printf("#   HF8  Correctness - Eltwise reduce    #\n");
+     } else if (dtype == LIBXSMM_DATATYPE_F16) {
+       printf("#   F16  Correctness - Eltwise reduce    #\n");
++    } else if (dtype == LIBXSMM_DATATYPE_I32) {
++      printf("#   I32  Correctness - Eltwise reduce    #\n");
+     } else {
+       printf("#   BF16 Correctness - Eltwise reduce    #\n");
+     }
+@@ -749,6 +850,8 @@ int main(int argc, char* argv[])
+       printf("# HF8  Correctness - Eltwise red. colsidx#\n");
+     } else if (dtype == LIBXSMM_DATATYPE_F16) {
+       printf("# F16  Correctness - Eltwise red. colsidx#\n");
++    } else if (dtype == LIBXSMM_DATATYPE_I32) {
++      printf("# I32  Correctness - Eltwise red. colsidx#\n");
+     } else {
+       printf("# BF16 Correctness - Eltwise red. colsidx#\n");
+     }
+@@ -767,6 +870,27 @@ int main(int argc, char* argv[])
+     }
+     if (dtype == LIBXSMM_DATATYPE_F64) {
+       libxsmm_matdiff(&norms_elts, LIBXSMM_DATATYPE_F64, result_size_check, 1, d_ref_result_reduce_elts, d_result_reduce_elts, 0, 0);
++    } else if (dtype == LIBXSMM_DATATYPE_I32) {
++      /* For I32, use exact integer comparison */
++      libxsmm_blasint errors = 0;
++      long long l1_ref_sum = 0, l1_tst_sum = 0;
++      for (libxsmm_blasint i = 0; i < result_size_check; i++) {
++        l1_ref_sum += abs(i_ref_result_reduce_elts[i]);
++        l1_tst_sum += abs(i_result_reduce_elts[i]);
++        if (i_ref_result_reduce_elts[i] != i_result_reduce_elts[i]) {
++          if (errors < 10) {
++            printf("  Mismatch at %ld: ref=%d test=%d\n", (long)i, i_ref_result_reduce_elts[i], i_result_reduce_elts[i]);
++          }
++          errors++;
++        }
++      }
++      memset(&norms_elts, 0, sizeof(norms_elts));
++      norms_elts.l1_ref = (double)l1_ref_sum;
++      norms_elts.l1_tst = (double)l1_tst_sum;
++      if (errors > 0) {
++        printf("  Total I32 mismatches: %ld\n", (long)errors);
++        norms_elts.normf_rel = 1.0;
++      }
+     } else {
+       libxsmm_matdiff(&norms_elts, LIBXSMM_DATATYPE_F32, result_size_check, 1, ref_result_reduce_elts, result_reduce_elts, 0, 0);
+     }
+@@ -850,6 +974,8 @@ int main(int argc, char* argv[])
+   for (k = 0; k < iters; k++) {
+     if (dtype == LIBXSMM_DATATYPE_F64) {
+       reference_reduce_kernel_f64( m, n, ld_in, (libxsmm_blasint)n_cols_idx, dinp, d_ref_result_reduce_elts, d_ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
++    } else if (dtype == LIBXSMM_DATATYPE_I32) {
++      reference_reduce_kernel_i32( m, n, ld_in, (libxsmm_blasint)n_cols_idx, (int*)sinp, (int*)ref_result_reduce_elts, (int*)ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
+     } else {
+       reference_reduce_kernel( m, n, ld_in, (libxsmm_blasint)n_cols_idx, sinp, ref_result_reduce_elts, ref_result_reduce_elts_squared, cols_ind_array, reduce_op, reduce_rows, record_idx, ref_argop_off, dtype, reduce_on_outputs );
+     }
+diff --git a/src/generator_mateltwise_reduce_avx_avx512.c b/src/generator_mateltwise_reduce_avx_avx512.c
+index a79c8c8bc..68cd459e8 100644
+--- a/src/generator_mateltwise_reduce_avx_avx512.c
++++ b/src/generator_mateltwise_reduce_avx_avx512.c
+@@ -716,6 +716,9 @@ void libxsmm_generator_reduce_cols_avx512_microkernel( libxsmm_generated_code*
+     if (LIBXSMM_DATATYPE_F64 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP)) {
+       reduce_instr = LIBXSMM_X86_INSTR_VADDPD;
+       reduce_instr_squared = LIBXSMM_X86_INSTR_VFMADD231PD;
++    } else if (LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP)) {
++      reduce_instr = LIBXSMM_X86_INSTR_VPADDD;
++      reduce_instr_squared = LIBXSMM_X86_INSTR_VPADDD; /* For I32, squared reduction will also use VPADDD */
+     } else {
+       reduce_instr = LIBXSMM_X86_INSTR_VADDPS;
+       reduce_instr_squared = LIBXSMM_X86_INSTR_VFMADD231PS;
+@@ -749,7 +752,7 @@ void libxsmm_generator_reduce_cols_avx512_microkernel( libxsmm_generated_code*
+     return;
+   }
+ 
+-  if ((compute_squared_vals_reduce > 0) && !(reduce_instr == LIBXSMM_X86_INSTR_VADDPS || reduce_instr == LIBXSMM_X86_INSTR_VADDPD)) {
++  if ((compute_squared_vals_reduce > 0) && !(reduce_instr == LIBXSMM_X86_INSTR_VADDPS || reduce_instr == LIBXSMM_X86_INSTR_VADDPD || reduce_instr == LIBXSMM_X86_INSTR_VPADDD)) {
+     /* This should not happen */
+     printf("Support for squares's reduction only when reduction OP is ADD\n");
+     LIBXSMM_HANDLE_ERROR( io_generated_code, LIBXSMM_ERR_GENERAL );
+@@ -1615,6 +1618,8 @@ void libxsmm_generator_reduce_rows_avx512_microkernel( libxsmm_generated_code*
+   if ( flag_reduce_op_add > 0 ) {
+     if (LIBXSMM_DATATYPE_F64 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP)) {
+       reduce_instr = LIBXSMM_X86_INSTR_VADDPD;
++    } else if (LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP)) {
++      reduce_instr = LIBXSMM_X86_INSTR_VPADDD;
+     } else {
+       reduce_instr = LIBXSMM_X86_INSTR_VADDPS;
+     }
+@@ -1647,7 +1652,7 @@ void libxsmm_generator_reduce_rows_avx512_microkernel( libxsmm_generated_code*
+     return;
+   }
+ 
+-  if ((compute_squared_vals_reduce > 0) && !(reduce_instr == LIBXSMM_X86_INSTR_VADDPS || reduce_instr == LIBXSMM_X86_INSTR_VADDPD)) {
++  if ((compute_squared_vals_reduce > 0) && !(reduce_instr == LIBXSMM_X86_INSTR_VADDPS || reduce_instr == LIBXSMM_X86_INSTR_VADDPD || reduce_instr == LIBXSMM_X86_INSTR_VPADDD)) {
+     /* This should not happen */
+     printf("Support for squares's reduction only when reduction OP is ADD\n");
+     LIBXSMM_HANDLE_ERROR( io_generated_code, LIBXSMM_ERR_GENERAL );
+diff --git a/src/generator_mateltwise_sse_avx_avx512.c b/src/generator_mateltwise_sse_avx_avx512.c
+index 9fce0c4ad..4439974be 100644
+--- a/src/generator_mateltwise_sse_avx_avx512.c
++++ b/src/generator_mateltwise_sse_avx_avx512.c
+@@ -850,7 +850,10 @@ libxsmm_blasint libxsmm_generator_mateltwise_x86_valid_arch_precision( libxsmm_g
+       !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_UNARY_RELU)) &&
+       !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_UNARY_RELU_INV)) &&
+       !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_UNARY_REPLICATE_COL_VAR )) &&
+-      !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_UNARY_IDENTITY))) {
++      !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_UNARY_IDENTITY)) &&
++      !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_BINARY) && (i_mateltwise_desc->param == LIBXSMM_MELTW_TYPE_BINARY_ADD) && (LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP))) &&
++      !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (libxsmm_meqn_is_unary_opcode_reduce_to_scalar(i_mateltwise_desc->param) > 0) && (LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP))) &&
++      !((i_mateltwise_desc->operation == LIBXSMM_MELTW_OPERATION_UNARY) && (libxsmm_meqn_is_unary_opcode_reduce_kernel(i_mateltwise_desc->param) > 0) && (LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP)))) {
+     if ( LIBXSMM_DATATYPE_BF16 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ||
+       LIBXSMM_DATATYPE_I16 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ||
+       LIBXSMM_DATATYPE_F16 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ||
+diff --git a/src/generator_mateltwise_unary_binary_avx_avx512.c b/src/generator_mateltwise_unary_binary_avx_avx512.c
+index 11ec8dfda..73df91365 100644
+--- a/src/generator_mateltwise_unary_binary_avx_avx512.c
++++ b/src/generator_mateltwise_unary_binary_avx_avx512.c
+@@ -2331,7 +2331,11 @@ void libxsmm_compute_binary_2d_reg_block( libxsmm_generated_code*
+   if ( io_generated_code->arch < LIBXSMM_X86_AVX ) {
+     switch (i_mateltwise_desc->param) {
+       case LIBXSMM_MELTW_TYPE_BINARY_ADD: {
+-        binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_ADDPS : LIBXSMM_X86_INSTR_ADDPD;
++        if ( LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) {
++          binary_op_instr = LIBXSMM_X86_INSTR_PADDD;
++        } else {
++          binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_ADDPS : LIBXSMM_X86_INSTR_ADDPD;
++        }
+       } break;
+       case LIBXSMM_MELTW_TYPE_BINARY_MUL: {
+         binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_MULPS : LIBXSMM_X86_INSTR_MULPD;
+@@ -2357,7 +2361,11 @@ void libxsmm_compute_binary_2d_reg_block( libxsmm_generated_code*
+   } else {
+     switch (i_mateltwise_desc->param) {
+       case LIBXSMM_MELTW_TYPE_BINARY_ADD: {
+-        binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_VADDPS : LIBXSMM_X86_INSTR_VADDPD;
++        if ( LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) {
++          binary_op_instr = LIBXSMM_X86_INSTR_VPADDD;
++        } else {
++          binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_VADDPS : LIBXSMM_X86_INSTR_VADDPD;
++        }
+       } break;
+       case LIBXSMM_MELTW_TYPE_BINARY_MUL: {
+         binary_op_instr = ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? LIBXSMM_X86_INSTR_VMULPS : LIBXSMM_X86_INSTR_VMULPD;
+@@ -2454,7 +2462,7 @@ void libxsmm_compute_binary_2d_reg_block( libxsmm_generated_code*
+   for (in = 0; in < i_n_blocking; in++) {
+     for (im = 0; im < i_m_blocking; im++) {
+       unsigned int l_bf16_compute = ( LIBXSMM_DATATYPE_BF16 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? 1 : 0;
+-      unsigned int l_vlen = (l_bf16_compute > 0) ? 32 : (( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? 16 : 8);
++      unsigned int l_vlen = (l_bf16_compute > 0) ? 32 : (( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) || LIBXSMM_DATATYPE_I32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ? 16 : 8);
+       unsigned int vmove_instr_in2 = (bcast_input == 0 || bcast_col == 1) ? i_micro_kernel_config->vmove_instruction_in1 : vbcast_instr;
+       unsigned int _im = (bcast_row == 1) ? 0 : im;
+       unsigned int _in = (bcast_col == 1) ? 0 : in;
+@@ -2812,8 +2820,9 @@ void libxsmm_setup_input_output_masks( libxsmm_generated_code*                 i
+       libxsmm_generator_initialize_avx512_mask(io_generated_code, i_tmp_reg, mask_reg_in, mask_in_count, fake_dt);
+       reserved_mask_regs++;
+     } else {
++      libxsmm_datatype comp_dt = libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP);
+       mask_reg_in = i_micro_kernel_config->inout_vreg_mask;
+-      libxsmm_generator_initialize_avx_mask(io_generated_code, mask_reg_in, i_m % i_vlen_in, ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ?  LIBXSMM_DATATYPE_F32 : LIBXSMM_DATATYPE_F64);
++      libxsmm_generator_initialize_avx_mask(io_generated_code, mask_reg_in, i_m % i_vlen_in, comp_dt);
+     }
+   }
+ 
+@@ -2856,9 +2865,10 @@ void libxsmm_setup_input_output_masks( libxsmm_generated_code*                 i
+         libxsmm_generator_initialize_avx512_mask(io_generated_code, i_tmp_reg, mask_reg_out, mask_out_count, fake_dt);
+         reserved_mask_regs++;
+       } else {
++        libxsmm_datatype comp_dt = libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP);
+         mask_reg_out = i_micro_kernel_config->reserved_zmms;
+         i_micro_kernel_config->reserved_zmms =  i_micro_kernel_config->reserved_zmms + 1;
+-        libxsmm_generator_initialize_avx_mask(io_generated_code, mask_reg_out, i_m % i_vlen_out, ( LIBXSMM_DATATYPE_F32 == libxsmm_meltw_getenum_precision(i_mateltwise_desc, LIBXSMM_MELTW_FIELD_COMP) ) ?  LIBXSMM_DATATYPE_F32 : LIBXSMM_DATATYPE_F64 );
++        libxsmm_generator_initialize_avx_mask(io_generated_code, mask_reg_out, i_m % i_vlen_out, comp_dt);
+       }
+     }
+   }
