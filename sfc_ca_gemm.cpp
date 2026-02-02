@@ -11,7 +11,7 @@
 
 #include "sfc_ca_gemm.hpp"
 
-template<typename DType>
+template<typename DType, int skip_c_reduction = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
   using CType = typename output_type<DType>::type;
@@ -51,28 +51,30 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
     }
     if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
   }
-  if (K_layers > 1) {
-    #pragma omp parallel for
-    for (int i_red = 0; i_red < Mb*Nb; i_red++) {
-      int i_m, i_n;
-      sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_red, index_tsize);
-      if (K_layers == 2) {
-        libxsmm_meltw_binary_param add_param;
-        add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-        add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-        add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
-        l_add_kernel(&add_param);
-      } else {
-        libxsmm_meltw_binary_param add_param;
-        libxsmm_meltw_unary_param reduce_param;
-        CType reduce_scratch[bm*bn];
-        reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-        reduce_param.out.primary  = (void*)reduce_scratch;
-        add_param.in0.primary  = (void*)reduce_scratch;
-        add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-        add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
-        l_reduce_kernel(&reduce_param);
-        l_add_kernel(&add_param);
+  if constexpr (skip_c_reduction == 0) {
+    if (K_layers > 1) {
+      #pragma omp parallel for
+      for (int i_red = 0; i_red < Mb*Nb; i_red++) {
+        int i_m, i_n;
+        sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_red, index_tsize);
+        if (K_layers == 2) {
+          libxsmm_meltw_binary_param add_param;
+          add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
+          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+          l_add_kernel(&add_param);
+        } else {
+          libxsmm_meltw_binary_param add_param;
+          libxsmm_meltw_unary_param reduce_param;
+          CType reduce_scratch[bm*bn];
+          reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+          reduce_param.out.primary  = (void*)reduce_scratch;
+          add_param.in0.primary  = (void*)reduce_scratch;
+          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
+          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+          l_reduce_kernel(&reduce_param);
+          l_add_kernel(&add_param);
+        }
       }
     }
   }
@@ -83,6 +85,16 @@ template<typename DType>
 void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C) {
   for (int i = 0; i < n_layers; i++) {
     run_gemm<DType>(config, A[i], B[i], C[i]);
+  }
+  return;
+}
+
+template <typename DType>
+void run_gemm_n_layers_no_reduction(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C)
+{
+  for (int i = 0; i < n_layers; i++)
+  {
+    run_gemm<DType, 1>(config, A[i], B[i], C[i]);
   }
   return;
 }
@@ -254,6 +266,24 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
   printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
+
+  if (K_layers > 1) {
+    // Now run without reduction inside the kernel and time that
+    double time_full_gemm = (t_end - t_start) / (1.0 * n_iters);
+    double time_reduction = 0.0;
+    // Estimate time spent in reduction
+    t_start = getTime();
+    for (long it = 0; it < n_iters; it++) {
+      run_gemm_n_layers_no_reduction<DType>(n_layers, gemm_cfg, A, B, C);
+    }
+    t_end = getTime();
+    printf("Time without reduction is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
+    printf("MEASURE %.7g SFC_CA_GEMM_NO_REDUCTION_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
+    time_reduction = time_full_gemm - (t_end - t_start) / (1.0 * n_iters);
+    double total_c_reduction_volume = (double)sizeof(CType) * (double)M * (double)N * (double)(n_layers) * (double)(K_layers);
+    double reduction_bw = (total_c_reduction_volume / (1024.0 * 1024.0 * 1024.0)) / (time_reduction);
+    printf("Estimated reduction time is %.5g ms (%.5g GB/s)\n", 1000.0 * time_reduction, reduction_bw);
+  }
 
   // Free buffers
   libxsmm_free(naive_b);
