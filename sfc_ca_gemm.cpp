@@ -89,6 +89,7 @@ void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **
 
 template<typename DType>
 int gemm_benchmark(int argc, char** argv) {
+  using CType = typename output_type<DType>::type;
   // Setup default GEMM sizes
   long M = 1024*4, N = 1024*4, K = 1024*4;
   long bm = 32, bn = 32, bk = 32;
@@ -117,12 +118,12 @@ int gemm_benchmark(int argc, char** argv) {
     if (argc > 9) {
       n_layers = atoi(argv[9]);
       if (n_layers == -1) {
-        double size_total = (double)sizeof(DType)*(double)1.0*((double)M*(double)K +(double)M*(double)N +(double)K*(double)N)/(1024.0*1024.0*1024.0);
+        double size_total = (double)1.0 * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N) / (1024.0 * 1024.0 * 1024.0);
         double low_limit_in_gb = 5.0;
         n_layers = 1;
         while (size_total < low_limit_in_gb) {
           n_layers++;
-          size_total = (double)sizeof(DType)*(double)n_layers*((double)M*(double)K +(double)M*(double)N +(double)K*(double)N)/(1024.0*1024.0*1024.0);
+          size_total = (double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N) / (1024.0 * 1024.0 * 1024.0);
         }
         printf("Autocalculated %ld layers with total size %.2g GB\n", n_layers, size_total);
       }
@@ -136,7 +137,6 @@ int gemm_benchmark(int argc, char** argv) {
   }
   
   long Mb = M/bm, Nb = N/bn, Kb = K/bk;
-  using CType = typename output_type<DType>::type;
   // Allocate buffers
   DType **B = (DType**) malloc(n_layers*sizeof(DType*));
   check_null_ptr(B, "B array");
@@ -249,11 +249,11 @@ int gemm_benchmark(int argc, char** argv) {
 
   // Print performance/model numbers
   double gflop = (2.0*(double)n_layers*(double)M*(double)N*(double)K) / (1000*1000*1000);
-  printf("Time is %.5g ms (%.5g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
-  printf("Effective model sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
-  printf("Effective total GEMM sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*((double)M*(double)K + (double)M*(double)N + (double)K*(double)N ))/(1024.0*1024.0*1024.0));
+  printf("Time is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
+  printf("Effective A sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
+  printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
-  printf("MEASURE %.6g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
+  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
 
   // Free buffers
   libxsmm_free(naive_b);
