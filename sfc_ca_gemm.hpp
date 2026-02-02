@@ -111,7 +111,7 @@ template <typename DType>
 gemm_config_t *setup_gemm_config(
     long M, long N, long K,
     long bm, long bn, long bk,
-    long kbf, long K_layers)
+    long &kbf, long &K_layers)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -193,7 +193,7 @@ template <typename DType>
 gemm_config_t *setup_gemm_config_onednn(
     long M, long N, long K,
     long bm, long bn, long bk,
-    long kbf, long K_layers)
+    long &kbf, long &K_layers)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
