@@ -267,6 +267,7 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
   printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
 
+  #if 0
   if (K_layers > 1) {
     // Now run without reduction inside the kernel and time that
     double time_full_gemm = (t_end - t_start) / (1.0 * n_iters);
@@ -284,6 +285,7 @@ int gemm_benchmark(int argc, char** argv) {
     double reduction_bw = (total_c_reduction_volume / (1024.0 * 1024.0 * 1024.0)) / (time_reduction);
     printf("Estimated reduction time is %.5g ms (%.5g GB/s)\n", 1000.0 * time_reduction, reduction_bw);
   }
+  #endif
 
   // Free buffers
   libxsmm_free(naive_b);
