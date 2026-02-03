@@ -11,7 +11,7 @@
 
 #include "sfc_ca_gemm.hpp"
 
-template<typename DType, int skip_c_reduction = 0>
+template<typename DType, int skip_c_reduction = 0, int use_ab_streaming_kernels = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
   using CType = typename output_type<DType>::type;
@@ -19,12 +19,22 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
   unsigned int index_tsize = config->index_tsize;
-  libxsmm_gemmfunction brgemm_kernel = config->brgemm_kernel;
+  libxsmm_gemmfunction brgemm_kernel = NULL;
   libxsmm_meltwfunction_unary zero_kernel = config->zero_kernel;
   libxsmm_tilecfgfunction tileconfig_kernel = config->tileconfig_kernel;
   libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel = config->l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel = config->l_reduce_kernel;
+
+  if constexpr (use_ab_streaming_kernels == 0) {
+    brgemm_kernel = config->brgemm_kernel_Astream_Bstream;
+  } else if constexpr (use_ab_streaming_kernels == 1) {
+    brgemm_kernel = config->brgemm_kernel_Astream;
+  } else if constexpr (use_ab_streaming_kernels == 2) {
+    brgemm_kernel = config->brgemm_kernel_Bstream;
+  } else {
+    brgemm_kernel = config->brgemm_kernel;
+  }
 
 #pragma omp parallel
   {
@@ -81,20 +91,21 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   return;
 }
 
-template<typename DType>
-void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C) {
+template <typename DType, int use_ab_streaming_kernels = 0>
+void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C)
+{
   for (int i = 0; i < n_layers; i++) {
-    run_gemm<DType>(config, A[i], B[i], C[i]);
+    run_gemm<DType, 0, use_ab_streaming_kernels>(config, A[i], B[i], C[i]);
   }
   return;
 }
 
-template <typename DType>
+template <typename DType, int use_ab_streaming_kernels = 0>
 void run_gemm_n_layers_no_reduction(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C)
 {
   for (int i = 0; i < n_layers; i++)
   {
-    run_gemm<DType, 1>(config, A[i], B[i], C[i]);
+    run_gemm<DType, 1, use_ab_streaming_kernels>(config, A[i], B[i], C[i]);
   }
   return;
 }
@@ -225,7 +236,7 @@ int gemm_benchmark(int argc, char** argv) {
   gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers);
 
   // Warmup iteration
-  run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
+  run_gemm_n_layers<DType, 0>(n_layers, gemm_cfg, A, B, C);
 
   // Check correctness if requested
   printf("##############################################################\n");
@@ -252,37 +263,58 @@ int gemm_benchmark(int argc, char** argv) {
     libxsmm_matdiff_reduce(&diff, &norms);
   }
 
-  // benchmark the GEMM
-  auto t_start = getTime();
-  for (long it = 0; it < n_iters; it++) {
-    run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
-  }
-  auto t_end = getTime();
-
-  // Print performance/model numbers
-  double gflop = (2.0*(double)n_layers*(double)M*(double)N*(double)K) / (1000*1000*1000);
-  printf("Time is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
-  printf("Effective A sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
-  printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
-  printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
-  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
-
-  if (K_layers > 1) {
-    // Now run without reduction inside the kernel and time that
-    double time_full_gemm = (t_end - t_start) / (1.0 * n_iters);
-    double time_reduction = 0.0;
-    // Estimate time spent in reduction
-    t_start = getTime();
-    for (long it = 0; it < n_iters; it++) {
-      run_gemm_n_layers_no_reduction<DType>(n_layers, gemm_cfg, A, B, C);
+  for (int tileload_combo = 0; tileload_combo < 4; tileload_combo++) {
+    // Dispatch to correct template instantiation based on runtime value
+    switch (tileload_combo) {
+      case 0: run_gemm_n_layers<DType, 0>(n_layers, gemm_cfg, A, B, C); break;
+      case 1: run_gemm_n_layers<DType, 1>(n_layers, gemm_cfg, A, B, C); break;
+      case 2: run_gemm_n_layers<DType, 2>(n_layers, gemm_cfg, A, B, C); break;
+      case 3: run_gemm_n_layers<DType, 3>(n_layers, gemm_cfg, A, B, C); break;
     }
-    t_end = getTime();
-    printf("Time without reduction is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
-    printf("MEASURE %.7g SFC_CA_GEMM_NO_REDUCTION_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
-    time_reduction = time_full_gemm - (t_end - t_start) / (1.0 * n_iters);
-    double total_c_reduction_volume = (double)sizeof(CType) * (double)M * (double)N * (double)(n_layers) * (double)(K_layers);
-    double reduction_bw = (total_c_reduction_volume / (1024.0 * 1024.0 * 1024.0)) / (time_reduction);
-    printf("Estimated reduction time is %.5g ms (%.5g GB/s)\n", 1000.0 * time_reduction, reduction_bw);
+    // benchmark the GEMM
+    auto t_start = getTime();
+    for (long it = 0; it < n_iters; it++)
+    {
+      switch (tileload_combo) {
+        case 0: run_gemm_n_layers<DType, 0>(n_layers, gemm_cfg, A, B, C); break;
+        case 1: run_gemm_n_layers<DType, 1>(n_layers, gemm_cfg, A, B, C); break;
+        case 2: run_gemm_n_layers<DType, 2>(n_layers, gemm_cfg, A, B, C); break;
+        case 3: run_gemm_n_layers<DType, 3>(n_layers, gemm_cfg, A, B, C); break;
+      }
+    }
+    auto t_end = getTime();
+
+    // Print performance/model numbers
+    double gflop = (2.0*(double)n_layers*(double)M*(double)N*(double)K) / (1000*1000*1000);
+    printf("Time is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
+    printf("Effective A sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
+    printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
+    printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
+    printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d_tileloadcombo%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads(), tileload_combo);
+#if 0
+    if (K_layers > 1) {
+      // Now run without reduction inside the kernel and time that
+      double time_full_gemm = (t_end - t_start) / (1.0 * n_iters);
+      double time_reduction = 0.0;
+      // Estimate time spent in reduction
+      t_start = getTime();
+      for (long it = 0; it < n_iters; it++) {
+        switch (tileload_combo) {
+          case 0: run_gemm_n_layers_no_reduction<DType, 0>(n_layers, gemm_cfg, A, B, C); break;
+          case 1: run_gemm_n_layers_no_reduction<DType, 1>(n_layers, gemm_cfg, A, B, C); break;
+          case 2: run_gemm_n_layers_no_reduction<DType, 2>(n_layers, gemm_cfg, A, B, C); break;
+          case 3: run_gemm_n_layers_no_reduction<DType, 3>(n_layers, gemm_cfg, A, B, C); break;
+        }
+      }
+      t_end = getTime();
+      printf("Time without reduction is %.5g ms (%.7g GFLOPS)\n", 1000.0*(t_end-t_start)/(1.0*n_iters), gflop/((t_end-t_start)/(1.0*n_iters)));
+      printf("MEASURE %.7g SFC_CA_GEMM_NO_REDUCTION_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d_tileloadcombo%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads(), tileload_combo);
+      time_reduction = time_full_gemm - (t_end - t_start) / (1.0 * n_iters);
+      double total_c_reduction_volume = (double)sizeof(CType) * (double)M * (double)N * (double)(n_layers) * (double)(K_layers);
+      double reduction_bw = (total_c_reduction_volume / (1024.0 * 1024.0 * 1024.0)) / (time_reduction);
+      printf("Estimated reduction time is %.5g ms (%.5g GB/s)\n", 1000.0 * time_reduction, reduction_bw);
+    }
+#endif
   }
 
   // Free buffers

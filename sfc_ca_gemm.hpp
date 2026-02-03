@@ -96,6 +96,10 @@ typedef struct
   unsigned char *sfc_index_map;
   unsigned int index_tsize;
   libxsmm_gemmfunction brgemm_kernel;
+  libxsmm_gemmfunction brgemm_kernel_Astream_Bstream;
+  libxsmm_gemmfunction brgemm_kernel_Astream;
+  libxsmm_gemmfunction brgemm_kernel_Bstream;
+
   libxsmm_meltwfunction_unary zero_kernel;
   libxsmm_tilecfgfunction tileconfig_kernel;
   libxsmm_tilecfgfunction tilerelease_kernel;
@@ -179,7 +183,17 @@ gemm_config_t *setup_gemm_config(
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
+  // Main BRGEMM kernel with A and B regular tileloads
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
+  // BRGEMM kernel with A and B streaming tileloads
+  l_prefetch_flags = (libxsmm_gemm_prefetch_type)(LIBXSMM_GEMM_AMX_STREAMING_TILELOAD_A | LIBXSMM_GEMM_AMX_STREAMING_TILELOAD_B);
+  config->brgemm_kernel_Astream_Bstream = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
+  // BRGEMM kernel with A streaming tileloads
+  l_prefetch_flags = (libxsmm_gemm_prefetch_type)(LIBXSMM_GEMM_AMX_STREAMING_TILELOAD_A);
+  config->brgemm_kernel_Astream = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
+  // BRGEMM kernel with B streaming tileloads
+  l_prefetch_flags = (libxsmm_gemm_prefetch_type)(LIBXSMM_GEMM_AMX_STREAMING_TILELOAD_B);
+  config->brgemm_kernel_Bstream = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
   auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_out, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype_out, dtype_out, dtype_comp);
