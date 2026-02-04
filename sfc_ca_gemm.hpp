@@ -155,10 +155,12 @@ gemm_config_t *setup_gemm_config(
   output_partial_array[0] = NULL;
   if (K_layers > 1)
   {
-    global_scratch = (CType *)libxsmm_aligned_malloc(M * N * sizeof(CType) * (K_layers - 1), ALIGNMENT_SIZE);
+    size_t scratch_size = (size_t)M * (size_t)N * sizeof(CType) * (size_t)(K_layers - 1);
+    global_scratch = (CType *)libxsmm_aligned_malloc(scratch_size, ALIGNMENT_SIZE);
     for (int i = 1; i < K_layers; i++)
     {
-      output_partial_array[i - 1] = (CType *)global_scratch + (i - 1) * M * N;
+      size_t scratch_offset = (size_t)(i - 1) * (size_t)M * (size_t)N;
+      output_partial_array[i - 1] = (CType *)global_scratch + scratch_offset;
     }
   }
   config->gemm_scratch = (void *)output_partial_array;
@@ -204,6 +206,12 @@ gemm_config_t *setup_gemm_config_onednn(
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
   long Mb = M / bm, Nb = N / bn, Kb = K / bk;
+
+#if 1
+  long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
+  long brcount = (Kb_per_layer + kbf - 1) / kbf;
+  long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
+#else
   long brcount = (Kb / K_layers) / kbf;
   while (Kb % K_layers != 0)
   {
@@ -214,6 +222,7 @@ gemm_config_t *setup_gemm_config_onednn(
     kbf--;
   }
   brcount = (Kb / K_layers) / kbf;
+#endif
 
   // Store basic parameters
   config->M = M;
@@ -235,10 +244,12 @@ gemm_config_t *setup_gemm_config_onednn(
   output_partial_array[0] = NULL;
   if (K_layers > 1)
   {
-    global_scratch = (DType *)libxsmm_aligned_malloc(M * N * sizeof(DType) * (K_layers - 1), ALIGNMENT_SIZE);
+    size_t scratch_size = (size_t)M * (size_t)N * sizeof(DType) * (size_t)(K_layers - 1);
+    global_scratch = (DType *)libxsmm_aligned_malloc(scratch_size, ALIGNMENT_SIZE);
     for (int i = 1; i < K_layers; i++)
     {
-      output_partial_array[i - 1] = (DType *)global_scratch + (i - 1) * M * N;
+      size_t scratch_offset = (size_t)(i - 1) * (size_t)M * (size_t)N;
+      output_partial_array[i - 1] = (DType *)global_scratch + scratch_offset;
     }
   }
   config->gemm_scratch = (void *)output_partial_array;

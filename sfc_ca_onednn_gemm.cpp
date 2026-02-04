@@ -19,6 +19,8 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
   dnnl::ukernel::brgemm* brgemm_onednn = (dnnl::ukernel::brgemm*)config->onednn_brgemm_kernel;
   // Get oneDNN kernel and thread-local data from config
   std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***tl_offsets_array = (std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***)config->onednn_A_B_offsets_ptrs;
+  long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
+  long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
 
 #pragma omp parallel
   {
@@ -29,15 +31,26 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
       dnnl::ukernel::attr_params params;
 
       if (brgemm_onednn != NULL)  brgemm_onednn->set_hw_context();
-      for (int i_k = 0; i_k < Kb / K_layers; i_k += brcount)
+      for (int i_k = 0; i_k < Kb_per_layer; i_k += brcount)
       {
 #pragma omp for nowait
         for (int i_sfc = 0; i_sfc < Mb * Nb * K_layers; i_sfc++) {
+          long brcount_use = brcount;
           libxsmm_gemm_param gemm_param;
           int i_m, i_n, i_k_layer = 0;
           sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_sfc % (Mb * Nb), index_tsize);
           i_k_layer = i_sfc / (Mb * Nb);
-          gemm_param.op.tertiary = (void *)&brcount;
+          if (i_k_layer == K_layers - 1) {
+            if (i_k + brcount > Kb_last_layer) {
+              brcount_use = Kb_last_layer - i_k;
+            }
+          }
+          else{
+            if (i_k + brcount > Kb_per_layer) {
+              brcount_use = Kb_per_layer - i_k;
+            }
+          }
+          gemm_param.op.tertiary = (void *)&brcount_use;
           gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * (K / K_layers) * bm);
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * (K / K_layers) * bn);
           gemm_param.c.primary = (i_k_layer > 0) ? (void *)((DType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
