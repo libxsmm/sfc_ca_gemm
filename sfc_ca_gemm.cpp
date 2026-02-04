@@ -25,28 +25,44 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel = config->l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel = config->l_reduce_kernel;
-
+  long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
+  long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
+  long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
+  
 #pragma omp parallel
   {
+    long brcount_use = brcount;
     if (tileconfig_kernel != NULL) tileconfig_kernel(NULL);
-    for (int i_k = 0; i_k < Kb / K_layers; i_k += brcount) {
+    for (int i_k = 0; i_k < Kb_per_layer; i_k += brcount){
 #pragma omp for nowait
       for (int i_sfc = 0; i_sfc < Mb * Nb * K_layers; i_sfc++) {
+        long brcount_use = brcount;
         libxsmm_gemm_param gemm_param;
         int i_m, i_n, i_k_layer = 0;
         sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_sfc % (Mb * Nb), index_tsize);
         i_k_layer = i_sfc / (Mb * Nb);
-        gemm_param.op.tertiary = (void*)&brcount;
-        gemm_param.a.primary = (void*)((DType*)A + i_m * K * bm + i_k * bk * bm + i_k_layer * (K/K_layers) * bm );
-        gemm_param.b.primary = (void*)((DType*)B + i_n * K * bn + i_k * bk * bn + i_k_layer * (K/K_layers) * bn );
+        if (i_k_layer == K_layers - 1) {
+          if (i_k + brcount > Kb_last_layer) {
+            brcount_use = Kb_last_layer - i_k;
+          }
+        } else {
+          if (i_k + brcount > Kb_per_layer) {
+            brcount_use = Kb_per_layer - i_k;
+          }
+        }
+        gemm_param.op.tertiary = (void *)&brcount_use;
+        gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
+        gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
         gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
                                                : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
-        if ((i_k == 0) && (brcount != (Kb/K_layers))) {
+        if ((i_k == 0) && (K_rounds_per_layer != 1)){
           libxsmm_meltw_unary_param zero_param;
           zero_param.out.primary = (void*)gemm_param.c.primary;
           zero_kernel( &zero_param );
         }
-        brgemm_kernel( &gemm_param );
+        if (brcount_use > 0) {
+          brgemm_kernel( &gemm_param );
+        }
       }
     }
     if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);

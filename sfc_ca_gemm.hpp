@@ -116,6 +116,12 @@ gemm_config_t *setup_gemm_config(
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
   long Mb = M / bm, Nb = N / bn, Kb = K / bk;
+
+#if 1
+  long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
+  long brcount = (Kb_per_layer + kbf - 1) / kbf;
+  long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
+#else
   long brcount = (Kb / K_layers) / kbf;
   while (Kb % K_layers != 0)
   {
@@ -126,6 +132,7 @@ gemm_config_t *setup_gemm_config(
     kbf--;
   }
   brcount = (Kb / K_layers) / kbf;
+#endif
 
   // Store basic parameters
   config->M = M;
@@ -174,8 +181,7 @@ gemm_config_t *setup_gemm_config(
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), bk * bn * sizeof(DType), brcount);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_comp);
-  if (brcount == (Kb / K_layers))
-    l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
+  if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
