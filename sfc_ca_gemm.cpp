@@ -352,11 +352,14 @@ int main(int argc, char** argv) {
     if (strcmp(argv[12],"BF8") == 0) {
       use_dtype = 2;
     }
-    if (strcmp(argv[12],"FP32") == 0) {
+    if (strcmp(argv[12],"F32") == 0) {
       use_dtype = 3;
     }
     if (strcmp(argv[12],"I8") == 0) {
       use_dtype = 4;
+    }
+    if (strcmp(argv[12],"F64") == 0) {
+      use_dtype = 5;
     }
   }
   if (use_dtype == 1) {
@@ -367,6 +370,8 @@ int main(int argc, char** argv) {
     return gemm_benchmark<float>(argc, argv);
   } else if (use_dtype == 4) {
     return gemm_benchmark<char>(argc, argv);
+  } else if (use_dtype == 5) {
+    return gemm_benchmark<double>(argc, argv);
   } else {
     return 0;
   }

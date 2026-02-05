@@ -174,8 +174,9 @@ gemm_config_t *setup_gemm_config(
   // Setup TPP kernels
   auto dtype = sfc_ca_gemm_get_libxsmm_dtype<DType>();
   auto dtype_out = sfc_ca_gemm_get_libxsmm_dtype<CType>();
-  // Computation type: I32 for I8 inputs, F32 for BF16/FP32
-  auto dtype_comp = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_I32 : LIBXSMM_DATATYPE_F32;
+  // Computation type: I32 for I8 inputs, F64 for F64 inputs, F32 for BF16/FP32
+  auto dtype_comp = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_I32 : 
+                    (dtype == LIBXSMM_DATATYPE_F64) ? LIBXSMM_DATATYPE_F64 : LIBXSMM_DATATYPE_F32;
   auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
@@ -375,6 +376,10 @@ template<> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype<int>() {
   return LIBXSMM_DATATYPE_I32;
 }
 
+template<> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype<double>() {
+  return LIBXSMM_DATATYPE_F64;
+}
+
 // Forward declaration of naive_fullyconnected struct
 typedef struct {
   long N;
@@ -480,6 +485,23 @@ template<> void sfc_ca_gemm_matrix_copy_NCNC_to_NC<libxsmm_bfloat8>(void *in, vo
   }
 }
 
+template<> void sfc_ca_gemm_matrix_copy_NCNC_to_NC<double>(void *in, void *out, long N, long M, long bn, long bm) {
+  double *src_ptr = (double*)in;
+  double *dst_ptr = (double*)out;
+  long nBlocks = N / bn;
+  long mBlocks = M / bm;
+  for (long n1 = 0; n1 < nBlocks; n1++) {
+    for (long m1 = 0; m1 < mBlocks; m1++) {
+      for (long n2 = 0; n2 < bn; n2++) {
+        for (long m2 = 0; m2 < bm; m2++) {
+          dst_ptr[(n1*bn+n2)*M + m1*bm+m2] = 
+            src_ptr[n1*mBlocks*bn*bm + m1*bn*bm + n2*bm + m2];
+        }
+      }
+    }
+  }
+}
+
 template<typename DType> void sfc_ca_gemm_rne_convert_fp32_lp(float *in, void *out, long size) {
   libxsmm_rne_convert_fp32_bf16(in, (libxsmm_bfloat16*)out, size);
   return;
@@ -516,6 +538,14 @@ template<> void sfc_ca_gemm_rne_convert_fp32_lp<int>(float *in, void *out, long 
   int *out_i32 = (int*)out;
   for (long i = 0; i < size; i++) {
     out_i32[i] = (int)(in[i]);
+  }
+  return;
+}
+
+template<> void sfc_ca_gemm_rne_convert_fp32_lp<double>(float *in, void *out, long size) {
+  double *out_f64 = (double*)out;
+  for (long i = 0; i < size; i++) {
+    out_f64[i] = (double)(in[i]);
   }
   return;
 }
@@ -560,6 +590,14 @@ template<> void sfc_ca_gemm_convert_lp_f32<int>(void *in, float *out, long size)
   int *in_i32 = (int*)in;
   for (long i = 0; i < size; i++) {
     out[i] = (float)in_i32[i];
+  }
+  return;
+}
+
+template<> void sfc_ca_gemm_convert_lp_f32<double>(void *in, float *out, long size) {
+  double *in_f64 = (double*)in;
+  for (long i = 0; i < size; i++) {
+    out[i] = (float)in_f64[i];
   }
   return;
 }
