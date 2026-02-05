@@ -44,8 +44,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
             if (i_k + brcount > Kb_last_layer) {
               brcount_use = Kb_last_layer - i_k;
             }
-          }
-          else{
+          } else {
             if (i_k + brcount > Kb_per_layer) {
               brcount_use = Kb_per_layer - i_k;
             }
@@ -125,9 +124,20 @@ int gemm_benchmark(int argc, char** argv) {
     N = atoi(argv[2]);
     K = atoi(argv[3]);
     bm = atoi(argv[4]);
+    while (M % bm != 0) bm--;
     bn = atoi(argv[5]);
+    while (N % bn != 0) bn--;
     bk = atoi(argv[6]);
-    if (argc > 7) {
+    while (K % bk != 0 || bk % 2 != 0) {
+      bk--;
+      if (bk <= 0)
+      {
+        printf("Error: could not find suitable bk value\n");
+        exit(0);
+      }
+    }
+    if (argc > 7)
+    {
       kbf = atoi(argv[7]);
     }
     if (argc > 8){
