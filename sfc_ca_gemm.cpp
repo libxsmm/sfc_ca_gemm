@@ -18,7 +18,6 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   using DType_comp = typename libxsmm_type_traits<DType>::comp_type;
   size_t padded_lock_size = config->padded_lock_size;
   long M = config->M, N = config->N, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb, bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
-  CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
   unsigned int index_tsize = config->index_tsize;
   libxsmm_gemmfunction brgemm_kernel = config->brgemm_kernel;
@@ -26,7 +25,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   libxsmm_tilecfgfunction tileconfig_kernel = config->tileconfig_kernel;
   libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel = config->l_add_kernel;
-  libxsmm_meltwfunction_unary l_reduce_kernel = config->l_reduce_kernel;
+  void *c_blocks_locks = config->c_blocks_locks;
   long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
   long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
   long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
@@ -34,7 +33,9 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
 #pragma omp parallel
   {
     DType_comp c_tmp[bm * bn];
+    libxsmm_meltw_binary_param add_param;
     long brcount_use = brcount;
+    add_param.in0.primary = (void *)c_tmp;
     /* Initialize matrix C with zeros in case we have 2.5D GEMM */
     if (K_layers > 1) {
 #pragma omp for
@@ -73,15 +74,13 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           zero_kernel(&zero_param);
         }
         if (brcount_use > 0) {
-          libxsmm_meltw_binary_param add_param;
           brgemm_kernel( &gemm_param );
           // Obtain the proper lock
-          void *lock_ptr = (void *)((char *)config->c_blocks_locks + (i_n * Mb + i_m) * padded_lock_size);
+          void *lock_ptr = (void *)((char *)c_blocks_locks + (i_n * Mb + i_m) * padded_lock_size);
           // Acquire lock for C block
           if (K_layers > 1) omp_set_lock((omp_lock_t *)lock_ptr);
           // Update C with the new partial result in c_tmp
           add_param.in1.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
-          add_param.in0.primary = (void *)c_tmp;
           add_param.out.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
           l_add_kernel(&add_param);
           // Release lock for C block
@@ -327,16 +326,9 @@ int gemm_benchmark(int argc, char** argv) {
   if (gemm_cfg->sfc_index_map != NULL) {
     libxsmm_free(gemm_cfg->sfc_index_map);
   }
-
-  CType **output_partial_array = (CType**)gemm_cfg->gemm_scratch;
-  if (output_partial_array[0] != NULL)
-  {
-    libxsmm_free(output_partial_array[0]);
-  }
   free(B);
   free(C);
   free(A);
-  libxsmm_free(gemm_cfg->gemm_scratch);
   delete gemm_cfg;
   return 0;
 }

@@ -157,38 +157,17 @@ gemm_config_t *setup_gemm_config(
   config->K_layers = K_layers;
   config->brcount = brcount;
 
-  // Find number of threads
-  int n_threads = omp_get_max_threads();
   // Pad the openmp lock size and pad to 64 byte to avoid false sharing
   size_t lock_size = sizeof(omp_lock_t);
   size_t padded_lock_size = ((lock_size + ALIGNMENT_SIZE - 1) / ALIGNMENT_SIZE) * ALIGNMENT_SIZE;
   // Allocate locks for C block updates in multi-threaded reduction
   config->c_blocks_locks = (void *)libxsmm_aligned_malloc(Mb * Nb * padded_lock_size, ALIGNMENT_SIZE);
   config->padded_lock_size = padded_lock_size;
-  omp_lock_t *locks = (omp_lock_t *)config->c_blocks_locks;
   // Go the proper offset to initialize the lock
   for (int i = 0; i < Mb * Nb; i++) {
     void *lock_addr = (void *)((char *)config->c_blocks_locks + i * padded_lock_size);
     omp_init_lock((omp_lock_t *)lock_addr);
   }
-
-  // Allocate output_partial scratch buffers for K_layers > 1
-  using CType = typename output_type<DType>::type;
-  int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
-  CType *global_scratch = NULL;
-  CType **output_partial_array = (CType**)libxsmm_aligned_malloc(sizeof(CType*) * n_out_copies, ALIGNMENT_SIZE);
-  output_partial_array[0] = NULL;
-  if (K_layers > 1)
-  {
-    size_t scratch_size = (size_t)M * (size_t)N * sizeof(CType) * (size_t)(K_layers - 1);
-    global_scratch = (CType *)libxsmm_aligned_malloc(scratch_size, ALIGNMENT_SIZE);
-    for (int i = 1; i < K_layers; i++)
-    {
-      size_t scratch_offset = (size_t)(i - 1) * (size_t)M * (size_t)N;
-      output_partial_array[i - 1] = (CType *)global_scratch + scratch_offset;
-    }
-  }
-  config->gemm_scratch = (void *)output_partial_array;
 
   // Create SFC index map
   unsigned char *sfc_index_map = NULL;
@@ -196,29 +175,26 @@ gemm_config_t *setup_gemm_config(
   config->sfc_index_map = sfc_index_map;
   config->index_tsize = index_tsize;
 
+  using CType = typename output_type<DType>::type;
   // Setup TPP kernels
   auto dtype = sfc_ca_gemm_get_libxsmm_dtype<DType>();
   auto dtype_out = sfc_ca_gemm_get_libxsmm_dtype<CType>();
   // Computation type: I32 for I8 inputs, F64 for F64 inputs, F32 for BF16/FP32
   auto dtype_comp = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_I32 : 
                     (dtype == LIBXSMM_DATATYPE_F64) ? LIBXSMM_DATATYPE_F64 : LIBXSMM_DATATYPE_F32;
-  auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
+  auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_FLAG_BETA_0;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_comp, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), bk * bn * sizeof(DType), brcount);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_out);
-  l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NTS_HINT);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
   auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_comp, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
-  auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype_out, dtype_out, dtype_comp);
-  config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
-
   return config;
 }
 
