@@ -326,6 +326,10 @@ int gemm_benchmark(int argc, char** argv) {
   if (gemm_cfg->sfc_index_map != NULL) {
     libxsmm_free(gemm_cfg->sfc_index_map);
   }
+  // Free locks
+  if (gemm_cfg->c_blocks_locks != NULL) {
+    libxsmm_free(gemm_cfg->c_blocks_locks);
+  }
   free(B);
   free(C);
   free(A);

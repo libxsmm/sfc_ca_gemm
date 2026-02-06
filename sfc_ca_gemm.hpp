@@ -161,12 +161,15 @@ gemm_config_t *setup_gemm_config(
   size_t lock_size = sizeof(omp_lock_t);
   size_t padded_lock_size = ((lock_size + ALIGNMENT_SIZE - 1) / ALIGNMENT_SIZE) * ALIGNMENT_SIZE;
   // Allocate locks for C block updates in multi-threaded reduction
-  config->c_blocks_locks = (void *)libxsmm_aligned_malloc(Mb * Nb * padded_lock_size, ALIGNMENT_SIZE);
-  config->padded_lock_size = padded_lock_size;
-  // Go the proper offset to initialize the lock
-  for (int i = 0; i < Mb * Nb; i++) {
-    void *lock_addr = (void *)((char *)config->c_blocks_locks + i * padded_lock_size);
-    omp_init_lock((omp_lock_t *)lock_addr);
+  config->c_blocks_locks = NULL;
+  if (K_layers > 1) {
+    config->c_blocks_locks = (void *)libxsmm_aligned_malloc(Mb * Nb * padded_lock_size, ALIGNMENT_SIZE);
+    config->padded_lock_size = padded_lock_size;
+    // Go the proper offset to initialize the lock
+    for (int i = 0; i < Mb * Nb; i++) {
+      void *lock_addr = (void *)((char *)config->c_blocks_locks + i * padded_lock_size);
+      omp_init_lock((omp_lock_t *)lock_addr);
+    }
   }
 
   // Create SFC index map
