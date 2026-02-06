@@ -15,6 +15,8 @@ template<typename DType, int skip_c_reduction = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
   using CType = typename output_type<DType>::type;
+  using DType_comp = typename libxsmm_type_traits<DType>::comp_type;
+  size_t padded_lock_size = config->padded_lock_size;
   long M = config->M, N = config->N, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb, bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
   CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
@@ -28,10 +30,21 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
   long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
   long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
-  
+
 #pragma omp parallel
   {
+    DType_comp c_tmp[bm * bn];
     long brcount_use = brcount;
+    /* Initialize matrix C with zeros in case we have 2.5D GEMM */
+    if (K_layers > 1) {
+#pragma omp for
+      for (int i_zero = 0; i_zero < Mb * Nb; i_zero++) {
+        libxsmm_meltw_unary_param zero_param;
+        int i_m = i_zero % Mb, i_n = i_zero / Mb;
+        zero_param.out.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+        zero_kernel(&zero_param);
+      }
+    }
     if (tileconfig_kernel != NULL) tileconfig_kernel(NULL);
     for (int i_k = 0; i_k < Kb_per_layer; i_k += brcount){
 #pragma omp for nowait
@@ -53,47 +66,32 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         gemm_param.op.tertiary = (void *)&brcount_use;
         gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
         gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
-        gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
-                                               : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
-        if ((i_k == 0) && (K_rounds_per_layer != 1)){
+        gemm_param.c.primary = (void *)c_tmp;
+        if (K_layers == 1 && i_k == 0) {
           libxsmm_meltw_unary_param zero_param;
-          zero_param.out.primary = (void*)gemm_param.c.primary;
-          zero_kernel( &zero_param );
+          zero_param.out.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+          zero_kernel(&zero_param);
         }
         if (brcount_use > 0) {
+          libxsmm_meltw_binary_param add_param;
           brgemm_kernel( &gemm_param );
+          // Obtain the proper lock
+          void *lock_ptr = (void *)((char *)config->c_blocks_locks + (i_n * Mb + i_m) * padded_lock_size);
+          // Acquire lock for C block
+          if (K_layers > 1) omp_set_lock((omp_lock_t *)lock_ptr);
+          // Update C with the new partial result in c_tmp
+          add_param.in1.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+          add_param.in0.primary = (void *)c_tmp;
+          add_param.out.primary = (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+          l_add_kernel(&add_param);
+          // Release lock for C block
+          if (K_layers > 1) omp_unset_lock((omp_lock_t *)lock_ptr);
         }
       }
     }
     if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
   }
-  if constexpr (skip_c_reduction == 0) {
-    if (K_layers > 1) {
-      #pragma omp parallel for
-      for (int i_red = 0; i_red < Mb*Nb; i_red++) {
-        int i_m, i_n;
-        sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_red, index_tsize);
-        if (K_layers == 2) {
-          libxsmm_meltw_binary_param add_param;
-          add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
-          l_add_kernel(&add_param);
-        } else {
-          libxsmm_meltw_binary_param add_param;
-          libxsmm_meltw_unary_param reduce_param;
-          CType reduce_scratch[bm*bn];
-          reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-          reduce_param.out.primary  = (void*)reduce_scratch;
-          add_param.in0.primary  = (void*)reduce_scratch;
-          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
-          l_reduce_kernel(&reduce_param);
-          l_add_kernel(&add_param);
-        }
-      }
-    }
-  }
+
   return;
 }
 

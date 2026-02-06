@@ -39,6 +39,14 @@ unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsig
 template<typename DType> struct output_type { using type = DType; };
 template<> struct output_type<char> { using type = int; };
 
+// Type trait to determine computation type (INT32 for INT8 input, FP64 for FP64 input, else FP32)
+template <typename DType>
+struct libxsmm_type_traits
+{
+  using comp_type = typename std::conditional<std::is_same<DType, char>::value, int,
+                  typename std::conditional<std::is_same<DType, double>::value, double, float>::type>::type;
+};
+
 // Timing utilities
 double ifreq;
 
@@ -105,6 +113,8 @@ typedef struct
   void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
   size_t onednn_scratchpad_size;
   void *onednn_A_B_offsets_ptrs;  // thread-local offset vectors
+  void *c_blocks_locks;  // Locks for C block updates in multi-threaded reduction
+  size_t padded_lock_size;  // Size of each lock with padding to avoid false sharing
 } gemm_config_t;
 
 template <typename DType>
@@ -147,6 +157,21 @@ gemm_config_t *setup_gemm_config(
   config->K_layers = K_layers;
   config->brcount = brcount;
 
+  // Find number of threads
+  int n_threads = omp_get_max_threads();
+  // Pad the openmp lock size and pad to 64 byte to avoid false sharing
+  size_t lock_size = sizeof(omp_lock_t);
+  size_t padded_lock_size = ((lock_size + ALIGNMENT_SIZE - 1) / ALIGNMENT_SIZE) * ALIGNMENT_SIZE;
+  // Allocate locks for C block updates in multi-threaded reduction
+  config->c_blocks_locks = (void *)libxsmm_aligned_malloc(Mb * Nb * padded_lock_size, ALIGNMENT_SIZE);
+  config->padded_lock_size = padded_lock_size;
+  omp_lock_t *locks = (omp_lock_t *)config->c_blocks_locks;
+  // Go the proper offset to initialize the lock
+  for (int i = 0; i < Mb * Nb; i++) {
+    void *lock_addr = (void *)((char *)config->c_blocks_locks + i * padded_lock_size);
+    omp_init_lock((omp_lock_t *)lock_addr);
+  }
+
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
   int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
@@ -180,16 +205,16 @@ gemm_config_t *setup_gemm_config(
   auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
-  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_out, dtype_comp);
+  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_comp, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), bk * bn * sizeof(DType), brcount);
-  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_comp);
-  if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
-  config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
+  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_out);
+  l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
+  config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NTS_HINT);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
-  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_out, dtype_out, dtype_out, dtype_comp);
+  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_comp, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype_out, dtype_out, dtype_comp);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
