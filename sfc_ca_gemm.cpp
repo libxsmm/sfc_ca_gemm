@@ -11,6 +11,11 @@
 
 #include "sfc_ca_gemm.hpp"
 
+extern "C" {
+  #include "knn_model.h"
+  #include "roofline_predictor.h"
+}
+
 template<typename DType, int skip_c_reduction = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
@@ -151,6 +156,24 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 8){
       K_layers = atoi(argv[8]);
+    }
+    
+    // Use k-NN model to predict optimal configuration if kbf=-1 and K_layers=-1
+    if (kbf == -1 && K_layers == -1) {
+      int predicted_kbf, predicted_K_layers;
+      predict_config_knn((int)M, (int)N, (int)K, &predicted_kbf, &predicted_K_layers);
+      kbf = predicted_kbf;
+      K_layers = predicted_K_layers;
+      printf("k-NN Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
+    }
+    
+    // Use roofline model to predict optimal configuration if kbf=-2 and K_layers=-2
+    if (kbf == -2 && K_layers == -2) {
+      int predicted_kbf, predicted_K_layers;
+      predict_config_roofline_simple(M, N, K, &predicted_kbf, &predicted_K_layers);
+      kbf = predicted_kbf;
+      K_layers = predicted_K_layers;
+      printf("Roofline Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
     }
     if (argc > 9) {
       n_layers = atoi(argv[9]);

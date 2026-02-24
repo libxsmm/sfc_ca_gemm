@@ -53,18 +53,28 @@ TARGET = sfc_ca_gemm
 TARGET_ONEDNN = sfc_ca_onednn_gemm
 SOURCES = sfc_ca_gemm.cpp
 SOURCES_ONEDNN = sfc_ca_onednn_gemm.cpp
-HEADERS = sfc_ca_gemm.hpp sfc_utils.h
+HEADERS = sfc_ca_gemm.hpp sfc_utils.h knn_model.h roofline_predictor.h
+KNN_MODEL_OBJ = knn_model.o
+ROOFLINE_PREDICTOR_OBJ = roofline_predictor.o
 
 .PHONY: all
 all: $(TARGET) $(TARGET_ONEDNN)
 
-$(TARGET): $(SOURCES) $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(IFLAGS) $(SOURCES) $(LFLAGS) $(LDFLAGS) -lxsmm -o $@
+# Compile k-NN model if needed
+$(KNN_MODEL_OBJ): knn_model.c knn_model.h
+	$(CXX) -c -O3 knn_model.c -o $(KNN_MODEL_OBJ)
+
+# Compile roofline predictor if needed
+$(ROOFLINE_PREDICTOR_OBJ): roofline_predictor.c roofline_predictor.h
+	$(CXX) -c -O3 -std=c99 roofline_predictor.c -o $(ROOFLINE_PREDICTOR_OBJ)
+
+$(TARGET): $(SOURCES) $(HEADERS) $(KNN_MODEL_OBJ) $(ROOFLINE_PREDICTOR_OBJ)
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES) $(KNN_MODEL_OBJ) $(ROOFLINE_PREDICTOR_OBJ) $(LFLAGS) $(LDFLAGS) -lxsmm -lm -o $@
 
 $(TARGET_ONEDNN): $(SOURCES_ONEDNN) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES_ONEDNN) $(LFLAGS) $(ONEDNN_LFLAGS) $(LDFLAGS) $(ONEDNN_LDFLAGS) -lxsmm -ldnnl -o $@
 
 clean:
-	rm -f $(TARGET) $(TARGET_ONEDNN) *.o
+	rm -f $(TARGET) $(TARGET_ONEDNN) $(KNN_MODEL_OBJ) $(ROOFLINE_PREDICTOR_OBJ) *.o
 
 .PHONY: all clean
