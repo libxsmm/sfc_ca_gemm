@@ -20,21 +20,29 @@ LIBXSMM_ROOT := $(if $(LIBXSMM_ROOT),$(LIBXSMM_ROOT),./libxsmm)
 
 # Compiler selection via SFC_CA_GEMM_COMPILER environment variable
 # Options: gcc (default), clang, icx
+CC = gcc
 CXX = g++
+CFLAGS = -fopenmp -O3
 CXXFLAGS = -fopenmp -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2
 
 ifeq ($(SFC_CA_GEMM_COMPILER),gcc)
+  CC := gcc
   CXX := g++
+  CFLAGS := -fopenmp -O3
   CXXFLAGS := -fopenmp -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2 -Wno-vla-cxx-extension
 endif
 
 ifeq ($(SFC_CA_GEMM_COMPILER),clang)
+  CC := clang
   CXX := clang++
+  CFLAGS := -fopenmp=libomp -O3
   CXXFLAGS := -Wno-unused-command-line-argument -Wno-format -fopenmp=libomp -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2 -Wno-vla-cxx-extension
 endif
 
 ifeq ($(SFC_CA_GEMM_COMPILER),icx)
+  CC := icx
   CXX := icpx
+  CFLAGS := -qopenmp -O3
   CXXFLAGS := -qopenmp -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2 -Wno-vla-cxx-extension
 endif
 
@@ -64,19 +72,19 @@ all: $(TARGET) $(TARGET_ONEDNN)
 
 # Compile unified k-NN model interface
 $(KNN_MODEL_OBJ): knn_model.c knn_model.h knn_model_emr.h knn_model_gnr.h
-	$(CXX) -c -O3 knn_model.c -o $(KNN_MODEL_OBJ)
+	$(CC) $(CFLAGS) -c knn_model.c -o $(KNN_MODEL_OBJ)
 
 # Compile EMR-specific k-NN model
 $(KNN_MODEL_EMR_OBJ): knn_model_emr.c knn_model_emr.h
-	$(CXX) -c -O3 knn_model_emr.c -o $(KNN_MODEL_EMR_OBJ)
+	$(CC) $(CFLAGS) -c knn_model_emr.c -o $(KNN_MODEL_EMR_OBJ)
 
 # Compile GNR-specific k-NN model
 $(KNN_MODEL_GNR_OBJ): knn_model_gnr.c knn_model_gnr.h
-	$(CXX) -c -O3 knn_model_gnr.c -o $(KNN_MODEL_GNR_OBJ)
+	$(CC) $(CFLAGS) -c knn_model_gnr.c -o $(KNN_MODEL_GNR_OBJ)
 
-# Compile roofline predictor if needed
+# Compile roofline predictor
 $(ROOFLINE_PREDICTOR_OBJ): roofline_predictor.c roofline_predictor.h
-	$(CXX) -c -O3 -std=c99 roofline_predictor.c -o $(ROOFLINE_PREDICTOR_OBJ)
+	$(CC) $(CFLAGS) -c roofline_predictor.c -o $(ROOFLINE_PREDICTOR_OBJ)
 
 $(TARGET): $(SOURCES) $(HEADERS) $(KNN_MODEL_OBJ) $(KNN_MODEL_EMR_OBJ) $(KNN_MODEL_GNR_OBJ) $(ROOFLINE_PREDICTOR_OBJ)
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES) $(KNN_MODEL_OBJ) $(KNN_MODEL_EMR_OBJ) $(KNN_MODEL_GNR_OBJ) $(ROOFLINE_PREDICTOR_OBJ) $(LFLAGS) $(LDFLAGS) -lxsmm -lm -o $@
