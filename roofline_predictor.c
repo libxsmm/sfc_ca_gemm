@@ -166,9 +166,9 @@ int get_platform_roofline_params(
         *threads = 128;                    /* Typical GNR core count */
         *bm = 32;
         *bn = 32;
-        *bw_per_core = 8.5;                /* GB/s - adjust based on GNR specs */
-        *c_bw_per_core = 8.5;              /* GB/s */
-        *compute_per_core = 2048.0;        /* GFLOPS - adjust based on GNR specs */
+        *bw_per_core = 5.15625;                /* GB/s */
+        *c_bw_per_core = 5.15625;              /* GB/s */
+        *compute_per_core = 1304.389445;   /* GFLOPS */
         *c_copies_limit = 8;
     } else {
         /* EMR (Emerald Rapids) or default parameters */
