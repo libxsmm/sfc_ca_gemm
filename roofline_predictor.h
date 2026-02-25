@@ -61,6 +61,30 @@ int predict_config_roofline_simple(
     int* K_layers
 );
 
+/**
+ * Get platform-specific hardware parameters for roofline model
+ * Automatically detects CPU platform (EMR or GNR) and returns appropriate values
+ * 
+ * @param threads            Output: Number of threads
+ * @param bm                 Output: Block size M
+ * @param bn                 Output: Block size N
+ * @param bw_per_core        Output: Bandwidth per core in GB/s
+ * @param c_bw_per_core      Output: C bandwidth per core in GB/s
+ * @param compute_per_core   Output: Compute throughput per core in GFLOPS
+ * @param c_copies_limit     Output: Maximum K_layers to consider
+ * 
+ * @return 0 on success, -1 on error
+ */
+int get_platform_roofline_params(
+    long long* threads,
+    long long* bm,
+    long long* bn,
+    double* bw_per_core,
+    double* c_bw_per_core,
+    double* compute_per_core,
+    long long* c_copies_limit
+);
+
 #ifdef __cplusplus
 }
 #endif

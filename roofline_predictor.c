@@ -11,6 +11,17 @@
 
 #include "roofline_predictor.h"
 #include <math.h>
+#include <string.h>
+#include <stdio.h>
+
+// Forward declaration for CPU detection from knn_model
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const char* detect_cpu_platform(void);
+#ifdef __cplusplus
+}
+#endif
 
 /* Helper function for max */
 static inline double max_double(double a, double b) {
@@ -129,6 +140,50 @@ int predict_config_roofline(
     return 0;
 }
 
+int get_platform_roofline_params(
+    long long* threads,
+    long long* bm,
+    long long* bn,
+    double* bw_per_core,
+    double* c_bw_per_core,
+    double* compute_per_core,
+    long long* c_copies_limit
+) {
+    /* Input validation */
+    if (!threads || !bm || !bn || !bw_per_core || !c_bw_per_core || !compute_per_core || !c_copies_limit) {
+        return -1;
+    }
+    
+    /* Detect CPU platform */
+    const char* platform = detect_cpu_platform();
+
+    /* Print the name of the detected platform */
+    printf("Detected CPU platform: %s\n", platform);
+    
+    /* Set parameters based on platform */
+    if (strcmp(platform, "GNR") == 0) {
+        /* GNR (Granite Rapids) parameters */
+        *threads = 128;                    /* Typical GNR core count */
+        *bm = 32;
+        *bn = 32;
+        *bw_per_core = 8.5;                /* GB/s - adjust based on GNR specs */
+        *c_bw_per_core = 8.5;              /* GB/s */
+        *compute_per_core = 2048.0;        /* GFLOPS - adjust based on GNR specs */
+        *c_copies_limit = 8;
+    } else {
+        /* EMR (Emerald Rapids) or default parameters */
+        *threads = 64;
+        *bm = 32;
+        *bn = 32;
+        *bw_per_core = 6.54;               /* GB/s */
+        *c_bw_per_core = 6.54;             /* GB/s */
+        *compute_per_core = 1517.505278;   /* GFLOPS */
+        *c_copies_limit = 8;
+    }
+    
+    return 0;
+}
+
 int predict_config_roofline_simple(
     long long M,
     long long N,
@@ -136,14 +191,19 @@ int predict_config_roofline_simple(
     int* kbf,
     int* K_layers
 ) {
-    /* Default hardware parameters optimized for the target platform */
-    const long long threads = 64;
-    const long long bm = 32;
-    const long long bn = 32;
-    const double bw_per_core = 6.54;        /* GB/s */
-    const double c_bw_per_core = 6.54;      /* GB/s */
-    const double compute_per_core = 1517.505278;  /* GFLOPS */
-    const long long c_copies_limit = 8;
+    /* Get platform-specific parameters */
+    long long threads, bm, bn, c_copies_limit;
+    double bw_per_core, c_bw_per_core, compute_per_core;
+    
+    int result = get_platform_roofline_params(
+        &threads, &bm, &bn,
+        &bw_per_core, &c_bw_per_core, &compute_per_core,
+        &c_copies_limit
+    );
+    
+    if (result != 0) {
+        return result;
+    }
 
     return predict_config_roofline(
         M, N, K, kbf, K_layers,

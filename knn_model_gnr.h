@@ -8,16 +8,29 @@
  ******************************************************************************/
 /* Evangelos Georganas (Intel Corp.)
 ******************************************************************************/
-/*
- * Unified k-NN Model Interface for GEMM Configuration Prediction
- * 
- * Automatically detects CPU platform (EMR or GNR) and dispatches to
- * the appropriate platform-specific model.
- * 
+/* 
+ * k-NN Model for GEMM Configuration Prediction (GNR Platform)
+ * Training samples: 441
+ * k value: 1
+ * Distance metric: euclidean
+ *
+ * Usage:
+ *   #include "knn_model_gnr.h"
+ *   
+ *   int main() {
+ *       int M = 4096, N = 4096, K = 4096;
+ *       int kbf, K_layers;
+ *       predict_config_knn_gnr(M, N, K, &kbf, &K_layers);
+ *       printf("Predicted: kbf=%d, K_layers=%d\n", kbf, K_layers);
+ *   }
+ *
+ * Compilation:
+ *   gcc -c -O3 knn_model_gnr.c -o knn_model_gnr.o
+ *   gcc your_program.c knn_model_gnr.o -lm -o your_program
  */
 
-#ifndef KNN_MODEL_H
-#define KNN_MODEL_H
+#ifndef KNN_MODEL_GNR_H
+#define KNN_MODEL_GNR_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,8 +38,6 @@ extern "C" {
 
 /*
  * Predict optimal kbf and K_layers configuration for given GEMM dimensions.
- * 
- * Automatically detects CPU platform and uses appropriate model.
  *
  * Parameters:
  *   M, N, K    - GEMM dimensions
@@ -35,18 +46,16 @@ extern "C" {
  *
  * Example:
  *   int kbf, K_layers;
- *   predict_config_knn(4096, 4096, 4096, &kbf, &K_layers);
+ *   predict_config_knn_gnr(4096, 4096, 4096, &kbf, &K_layers);
  */
-void predict_config_knn(int M, int N, int K, int* out_kbf, int* out_K_layers);
+void predict_config_knn_gnr(int M, int N, int K, int* out_kbf, int* out_K_layers);
 
-/*
- * Detect CPU platform
- * Returns: "EMR", "GNR", or "UNKNOWN"
- */
-const char* detect_cpu_platform(void);
+/* Get model information */
+int get_knn_k_value_gnr(void);           /* Returns k (number of neighbors) */
+int get_knn_training_samples_gnr(void);  /* Returns number of training samples */
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* KNN_MODEL_H */
+#endif /* KNN_MODEL_GNR_H */

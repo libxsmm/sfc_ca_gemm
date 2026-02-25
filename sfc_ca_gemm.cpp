@@ -170,7 +170,23 @@ int gemm_benchmark(int argc, char** argv) {
     // Use roofline model to predict optimal configuration if kbf=-2 and K_layers=-2
     if (kbf == -2 && K_layers == -2) {
       int predicted_kbf, predicted_K_layers;
-      predict_config_roofline_simple(M, N, K, &predicted_kbf, &predicted_K_layers);
+      // Get platform-specific parameters
+      long long hw_threads, hw_bm, hw_bn, hw_c_copies_limit;
+      double hw_bw_per_core, hw_c_bw_per_core, hw_compute_per_core;
+      
+      get_platform_roofline_params(
+          &hw_threads, &hw_bm, &hw_bn,
+          &hw_bw_per_core, &hw_c_bw_per_core, &hw_compute_per_core,
+          &hw_c_copies_limit
+      );
+      
+      predict_config_roofline(
+          M, N, K, &predicted_kbf, &predicted_K_layers,
+          hw_threads, hw_bm, hw_bn,
+          hw_bw_per_core, hw_c_bw_per_core, hw_compute_per_core,
+          hw_c_copies_limit
+      );
+      
       kbf = predicted_kbf;
       K_layers = predicted_K_layers;
       printf("Roofline Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
