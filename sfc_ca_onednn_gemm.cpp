@@ -3,6 +3,11 @@
  ***************************************************************************/
 #include "sfc_ca_gemm.hpp"
 
+extern "C" {
+  #include "knn_model.h"
+  #include "roofline_predictor.h"
+}
+
 template<typename DType>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
   // Unpack configuration struct
@@ -15,22 +20,24 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
   libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel = config->l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel = config->l_reduce_kernel;
-  // Get oneDNN brgemm kernel from config
-  dnnl::ukernel::brgemm* brgemm_onednn = (dnnl::ukernel::brgemm*)config->onednn_brgemm_kernel;
+  // Get oneDNN brgemm kernels map from config
+  auto *brgemm_kernels_map = (std::map<long, dnnl::ukernel::brgemm*>*)config->onednn_brgemm_kernels_map;
   // Get oneDNN kernel and thread-local data from config
-  std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***tl_offsets_array = (std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***)config->onednn_A_B_offsets_ptrs;
+  auto *tl_offsets_map = (std::map<long, std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>**>*)config->onednn_A_B_offsets_ptrs;
   long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
   long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
 
 #pragma omp parallel
   {
       int tid = omp_get_thread_num();
-      auto &tl_A_B_offsets = *(*tl_offsets_array)[tid];
       float C_acc_buffer[bm * bn];
       unsigned char tl_scratchpad_raw[config->onednn_scratchpad_size];
       dnnl::ukernel::attr_params params;
 
-      if (brgemm_onednn != NULL)  brgemm_onednn->set_hw_context();
+      // Set HW context once per thread using the main kernel
+      if (brgemm_kernels_map != NULL && !brgemm_kernels_map->empty())  
+        (*brgemm_kernels_map)[brcount]->set_hw_context();
+      
       for (int i_k = 0; i_k < Kb_per_layer; i_k += brcount)
       {
 #pragma omp for nowait
@@ -49,6 +56,10 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
               brcount_use = Kb_per_layer - i_k;
             }
           }
+          
+          // Skip if brcount_use is 0 or negative
+          if (brcount_use <= 0) continue;
+          
           gemm_param.op.tertiary = (void *)&brcount_use;
           gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * (K / K_layers) * bm);
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * (K / K_layers) * bn);
@@ -59,15 +70,29 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, DType *C) {
               zero_param.out.primary = (void *)gemm_param.c.primary;
               zero_kernel(&zero_param);
           }
+          
+          // Get the appropriate kernel for this brcount_use
+          auto kernel_it = brgemm_kernels_map->find(brcount_use);
+          if (kernel_it == brgemm_kernels_map->end()) {
+            printf("Error: No brgemm kernel found for brcount=%ld\n", brcount_use);
+            continue;
+          }
+          dnnl::ukernel::brgemm* brgemm_kernel = kernel_it->second;
+          
+          // Get the appropriate offset vector for this brcount_use
+          auto &tl_A_B_offsets = *((*tl_offsets_map)[brcount_use][tid]);
+          
           // Prepare post-ops: pointer to destination for binary add
           const void* binary_po_ptr = gemm_param.c.primary;
           params.set_post_ops_args(&binary_po_ptr);
-          // Execute oneDNN brgemm
-          brgemm_onednn->execute(gemm_param.b.primary, gemm_param.a.primary, tl_A_B_offsets, 
+          
+          // Execute oneDNN brgemm with the appropriate kernel
+          brgemm_kernel->execute(gemm_param.b.primary, gemm_param.a.primary, tl_A_B_offsets, 
                                  C_acc_buffer, gemm_param.c.primary, tl_scratchpad_raw, params);
       }
     }
-    if (brgemm_onednn != NULL) dnnl::ukernel::brgemm::release_hw_context();
+    if (brgemm_kernels_map != NULL && !brgemm_kernels_map->empty()) 
+      dnnl::ukernel::brgemm::release_hw_context();
   }
   if (K_layers > 1) {
     #pragma omp parallel for
@@ -142,6 +167,24 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 8){
       K_layers = atoi(argv[8]);
+    }
+    
+    // Use k-NN model to predict optimal configuration if kbf=-1 and K_layers=-1
+    if (kbf == -1 && K_layers == -1) {
+      int predicted_kbf, predicted_K_layers;
+      predict_config_knn((int)M, (int)N, (int)K, &predicted_kbf, &predicted_K_layers);
+      kbf = predicted_kbf;
+      K_layers = predicted_K_layers;
+      printf("k-NN Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
+    }
+    
+    // Use roofline model to predict optimal configuration if kbf=-2 and K_layers=-2
+    if (kbf == -2 && K_layers == -2) {
+      int predicted_kbf, predicted_K_layers;
+      predict_config_roofline_simple(M, N, K, &predicted_kbf, &predicted_K_layers);
+      kbf = predicted_kbf;
+      K_layers = predicted_K_layers;
+      printf("Roofline Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
     }
     if (argc > 9) {
       n_layers = atoi(argv[9]);
@@ -300,19 +343,26 @@ int gemm_benchmark(int argc, char** argv) {
   }
   
   // Free oneDNN-specific resources
-  if (gemm_cfg->onednn_brgemm_kernel != NULL) {
-    dnnl::ukernel::brgemm* brgemm_onednn = (dnnl::ukernel::brgemm*)gemm_cfg->onednn_brgemm_kernel;
-    delete brgemm_onednn;
+  if (gemm_cfg->onednn_brgemm_kernels_map != NULL) {
+    auto *brgemm_kernels_map = (std::map<long, dnnl::ukernel::brgemm*>*)gemm_cfg->onednn_brgemm_kernels_map;
+    // Delete all brgemm kernels in the map
+    for (auto &kv : *brgemm_kernels_map) {
+      delete kv.second;
+    }
+    delete brgemm_kernels_map;
   }
   if (gemm_cfg->onednn_A_B_offsets_ptrs != NULL) {
-    std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>*** tl_offsets_array = 
-      (std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>***)gemm_cfg->onednn_A_B_offsets_ptrs;
+    auto *tl_offsets_map = (std::map<long, std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>**>*)gemm_cfg->onednn_A_B_offsets_ptrs;
     int num_threads = omp_get_max_threads();
-    for (int t = 0; t < num_threads; t++) {
-      delete (*tl_offsets_array)[t];
+    // Free all offset vectors for each brcount value
+    for (auto &kv : *tl_offsets_map) {
+      auto **tl_offsets_array = kv.second;
+      for (int t = 0; t < num_threads; t++) {
+        delete tl_offsets_array[t];
+      }
+      delete[] tl_offsets_array;
     }
-    delete[] (*tl_offsets_array);
-    delete[] tl_offsets_array;
+    delete tl_offsets_map;
   }
   
   free(BC);

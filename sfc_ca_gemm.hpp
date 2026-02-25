@@ -19,6 +19,7 @@
 #include "oneapi/dnnl/dnnl.hpp"
 #include "oneapi/dnnl/dnnl_ukernel.hpp"
 #include <vector>
+#include <map>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,9 +103,10 @@ typedef struct
   libxsmm_meltwfunction_binary l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel;
   // oneDNN-specific fields
-  void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
+  void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm* (main kernel with full brcount)
+  void *onednn_brgemm_kernels_map;  // std::map<long, dnnl::ukernel::brgemm*>* (kernels for different brcount values)
   size_t onednn_scratchpad_size;
-  void *onednn_A_B_offsets_ptrs;  // thread-local offset vectors
+  void *onednn_A_B_offsets_ptrs;  // thread-local offset vectors (indexed by [brcount][tid])
 } gemm_config_t;
 
 template <typename DType>
@@ -277,7 +279,7 @@ gemm_config_t *setup_gemm_config_onednn(
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype, dtype, LIBXSMM_DATATYPE_F32);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
 
-  // Create oneDNN brgemm kernel
+  // Create oneDNN brgemm kernels for different brcount values
   dnnl::memory::data_type a_dt = dnnl::memory::data_type::bf16;
   dnnl::memory::data_type b_dt = dnnl::memory::data_type::bf16;
   dnnl::memory::data_type c_dt = dnnl::memory::data_type::bf16;
@@ -287,57 +289,70 @@ gemm_config_t *setup_gemm_config_onednn(
   const dnnl::memory::dim ldc = bm; // Local C buffer leading dimension
   const dnnl::memory::dim ldd = bm; // D (BF16 output) leading dimension
 
-  // Allocate oneDNN brgemm kernel on heap (must persist beyond setup)
-  dnnl::ukernel::brgemm *brgemm_onednn = new dnnl::ukernel::brgemm(bn, bm, bk, brcount, lda, ldb, ldc, a_dt, b_dt, c_dt, true);
+  // Create a map to store brgemm kernels for different brcount values
+  auto *brgemm_kernels_map = new std::map<long, dnnl::ukernel::brgemm*>();
+  
+  // Create kernels for all possible brcount values (1 to brcount)
+  for (long bc = 1; bc <= brcount; bc++) {
+    dnnl::ukernel::brgemm *brgemm_kernel = new dnnl::ukernel::brgemm(bn, bm, bk, bc, lda, ldb, ldc, a_dt, b_dt, c_dt, true);
 
-  if (!(*brgemm_onednn))
-  {
-    printf("Error: oneDNN brgemm object was not constructed.\n");
-    delete brgemm_onednn;
-    config->onednn_brgemm_kernel = NULL;
-    return config;
-  }
-
-  // Create post-ops: convert F32->BF16, then binary add with destination
-  dnnl::memory::dims binary_add_dims = {bn, bm};
-  auto binary_add_md = dnnl::memory::desc(binary_add_dims, dnnl::memory::data_type::bf16, {ldd, 1});
-
-  dnnl::post_ops brgemm_po;
-  brgemm_po.append_binary(dnnl::algorithm::binary_add, binary_add_md);
-
-  brgemm_onednn->set_post_ops(ldd, dnnl::memory::data_type::bf16, brgemm_po);
-
-  if (!brgemm_onednn->finalize())
-  {
-    printf("oneDNN brgemm kernel is not supported on this platform.\n");
-    delete brgemm_onednn;
-    config->onednn_brgemm_kernel = NULL;
-    return config;
-  }
-  brgemm_onednn->generate();
-
-  config->onednn_brgemm_kernel = (void *)brgemm_onednn;
-  config->onednn_scratchpad_size = brgemm_onednn->get_scratchpad_size();
-
-  // Create thread-local A_B_offsets buffers (one per thread)
-  int num_threads = omp_get_max_threads();
-  std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> ***tl_offsets_array =
-      new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> **[1];
-  tl_offsets_array[0] = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>> *[num_threads];
-
-  for (int t = 0; t < num_threads; t++)
-  {
-    tl_offsets_array[0][t] = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>(brcount);
-    const size_t a_dt_size = sizeof(DType);
-    const size_t b_dt_size = sizeof(DType);
-    for (dnnl::memory::dim br = 0; br < brcount; br++)
+    if (!(*brgemm_kernel))
     {
-      const dnnl::memory::dim A_offset_br = br * bk * bn * a_dt_size;
-      const dnnl::memory::dim B_offset_br = br * bk * bm * b_dt_size;
-      (*tl_offsets_array[0][t])[br] = std::make_pair(A_offset_br, B_offset_br);
+      printf("Error: oneDNN brgemm object (brcount=%ld) was not constructed.\n", bc);
+      delete brgemm_kernel;
+      continue;
     }
+
+    // Create post-ops: convert F32->BF16, then binary add with destination
+    dnnl::memory::dims binary_add_dims = {bn, bm};
+    auto binary_add_md = dnnl::memory::desc(binary_add_dims, dnnl::memory::data_type::bf16, {ldd, 1});
+
+    dnnl::post_ops brgemm_po;
+    brgemm_po.append_binary(dnnl::algorithm::binary_add, binary_add_md);
+
+    brgemm_kernel->set_post_ops(ldd, dnnl::memory::data_type::bf16, brgemm_po);
+
+    if (!brgemm_kernel->finalize())
+    {
+      printf("oneDNN brgemm kernel (brcount=%ld) is not supported on this platform.\n", bc);
+      delete brgemm_kernel;
+      continue;
+    }
+    brgemm_kernel->generate();
+    
+    // Store kernel in map
+    (*brgemm_kernels_map)[bc] = brgemm_kernel;
   }
-  config->onednn_A_B_offsets_ptrs = (void *)tl_offsets_array;
+  
+  // Store the main kernel (with full brcount) and the map
+  config->onednn_brgemm_kernel = (void *)((*brgemm_kernels_map)[brcount]);
+  config->onednn_brgemm_kernels_map = (void *)brgemm_kernels_map;
+  config->onednn_scratchpad_size = (*brgemm_kernels_map)[brcount]->get_scratchpad_size();
+
+  // Create thread-local A_B_offsets buffers (indexed by [brcount_value][thread_id])
+  int num_threads = omp_get_max_threads();
+  auto *tl_offsets_map = new std::map<long, std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>**>();
+  
+  const size_t a_dt_size = sizeof(DType);
+  const size_t b_dt_size = sizeof(DType);
+  
+  // Create offset vectors for each brcount value
+  for (long bc = 1; bc <= brcount; bc++) {
+    auto **tl_offsets_array = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>*[num_threads];
+    
+    for (int t = 0; t < num_threads; t++)
+    {
+      tl_offsets_array[t] = new std::vector<std::pair<dnnl::memory::dim, dnnl::memory::dim>>(bc);
+      for (dnnl::memory::dim br = 0; br < bc; br++)
+      {
+        const dnnl::memory::dim A_offset_br = br * bk * bn * a_dt_size;
+        const dnnl::memory::dim B_offset_br = br * bk * bm * b_dt_size;
+        (*tl_offsets_array[t])[br] = std::make_pair(A_offset_br, B_offset_br);
+      }
+    }
+    (*tl_offsets_map)[bc] = tl_offsets_array;
+  }
+  config->onednn_A_B_offsets_ptrs = (void *)tl_offsets_map;
 
   return config;
 }
