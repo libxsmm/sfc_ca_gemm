@@ -11,6 +11,17 @@
 
 #include "sfc_ca_gemm.hpp"
 
+#define PRINT_THREAD_WORK_ASSIGNMENT
+
+// Define struct to store work per thread
+typedef struct
+{
+  long thread_id;
+  long m_block;
+  long n_block;
+  long k_layer;
+} thread_work_t;
+
 template<typename DType, int skip_c_reduction = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   // Unpack configuration struct
@@ -127,6 +138,7 @@ int gemm_benchmark(int argc, char** argv) {
   long n_iters = 1;
   long i;
   long check_correctness = 0;
+  long m_step = 1, n_step = 1;
 
   ifreq = 1.0 / getFreq();
   // Read command line arguments
@@ -170,6 +182,13 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 11) {
       check_correctness = atoi(argv[11]);
+    }
+    // argv[12] is dtype, parsed in main()
+    if (argc > 13) {
+      m_step = atoi(argv[13]);
+    }
+    if (argc > 14) {
+      n_step = atoi(argv[14]);
     }
   }
   
@@ -247,7 +266,7 @@ int gemm_benchmark(int argc, char** argv) {
   } 
   
   // Setup GEMM configuration
-  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers);
+  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step);
 
   // Warmup iteration
   run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
@@ -292,7 +311,42 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
   printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
 
-  #if 0
+#ifdef PRINT_THREAD_WORK_ASSIGNMENT
+  // We run foo loop to capture work assignment thread_work_t
+  // Open a file to write the thread work assignment
+  FILE *f = fopen("thread_work_assignment.txt", "w");
+  thread_work_t *thread_work = (thread_work_t *)malloc(Mb * Nb * K_layers * sizeof(thread_work_t));
+  long index_to_store = 0;
+#pragma omp parallel for
+  for (int i_sfc = 0; i_sfc < Mb * Nb * K_layers; i_sfc++)
+  {
+    int tid = omp_get_thread_num();
+    int i_m, i_n, i_k_layer = 0;
+    sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, gemm_cfg->sfc_index_map, i_sfc % (Mb * Nb), gemm_cfg->index_tsize);
+    i_k_layer = i_sfc / (Mb * Nb);
+#pragma omp critical
+    {
+      thread_work[index_to_store].thread_id = tid;
+      thread_work[index_to_store].m_block = i_m;
+      thread_work[index_to_store].n_block = i_n;
+      thread_work[index_to_store].k_layer = i_k_layer;
+      index_to_store++;
+    }
+  }
+  // Print the info stored in thread_work
+  for (long i = 0; i < index_to_store; i++)
+  {
+    fprintf(f, "Thread %ld, M-block %ld, N-block %ld, K-layer %ld\n",
+            thread_work[i].thread_id,
+            thread_work[i].m_block,
+            thread_work[i].n_block,
+            thread_work[i].k_layer);
+  }
+  fclose(f);
+  free(thread_work);
+#endif
+
+#if 0
   if (K_layers > 1) {
     // Now run without reduction inside the kernel and time that
     double time_full_gemm = (t_end - t_start) / (1.0 * n_iters);
@@ -310,7 +364,7 @@ int gemm_benchmark(int argc, char** argv) {
     double reduction_bw = (total_c_reduction_volume / (1024.0 * 1024.0 * 1024.0)) / (time_reduction);
     printf("Estimated reduction time is %.5g ms (%.5g GB/s)\n", 1000.0 * time_reduction, reduction_bw);
   }
-  #endif
+#endif
 
   // Free buffers
   libxsmm_free(naive_b);

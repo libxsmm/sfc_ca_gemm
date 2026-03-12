@@ -116,6 +116,7 @@ int gemm_benchmark(int argc, char** argv) {
   long n_iters = 1;
   long i;
   long check_correctness = 0;
+  long m_step = 1, n_step = 1;
 
   ifreq = 1.0 / getFreq();
   // Read command line arguments
@@ -161,6 +162,13 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 11) {
       check_correctness = atoi(argv[11]);
+    }
+    // argv[12] is dtype, parsed in main()
+    if (argc > 13) {
+      m_step = atoi(argv[13]);
+    }
+    if (argc > 14) {
+      n_step = atoi(argv[14]);
     }
   }
   
@@ -229,7 +237,7 @@ int gemm_benchmark(int argc, char** argv) {
   } 
   
   // Setup GEMM configuration with oneDNN brgemm
-  gemm_config_t *gemm_cfg = setup_gemm_config_onednn<DType>(M, N, K, bm, bn, bk, kbf, K_layers);
+  gemm_config_t *gemm_cfg = setup_gemm_config_onednn<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step);
 
   // Warmup iteration
   run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, BC);

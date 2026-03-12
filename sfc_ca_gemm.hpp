@@ -12,6 +12,7 @@
 #ifndef SFC_CA_GEMM_HPP
 #define SFC_CA_GEMM_HPP
 
+#define USE_ONEDNN
 // oneDNN ukernel API
 #ifndef DNNL_EXPERIMENTAL_UKERNEL
 #define DNNL_EXPERIMENTAL_UKERNEL
@@ -33,7 +34,7 @@
 
 // Forward declarations
 template<typename DType> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype();
-unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb);
+unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb, unsigned int m_step = 1, unsigned int n_step = 1);
 
 // Type trait to determine output type (INT32 for INT8 input, same as input otherwise)
 template<typename DType> struct output_type { using type = DType; };
@@ -101,6 +102,7 @@ typedef struct
   libxsmm_tilecfgfunction tilerelease_kernel;
   libxsmm_meltwfunction_binary l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel;
+  long m_step, n_step;  // SFC coarsening step sizes (default 1)
   // oneDNN-specific fields
   void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
   size_t onednn_scratchpad_size;
@@ -111,7 +113,8 @@ template <typename DType>
 gemm_config_t *setup_gemm_config(
     long M, long N, long K,
     long bm, long bn, long bk,
-    long &kbf, long &K_layers)
+    long &kbf, long &K_layers,
+    long m_step = 1, long n_step = 1)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -146,6 +149,8 @@ gemm_config_t *setup_gemm_config(
   config->bk = bk;
   config->K_layers = K_layers;
   config->brcount = brcount;
+  config->m_step = m_step;
+  config->n_step = n_step;
 
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
@@ -165,9 +170,9 @@ gemm_config_t *setup_gemm_config(
   }
   config->gemm_scratch = (void *)output_partial_array;
 
-  // Create SFC index map
+  // Create SFC index map (coarsened SFC ordering baked into full Mb x Nb map)
   unsigned char *sfc_index_map = NULL;
-  unsigned int index_tsize = sfc_ca_gemm_fill_sfc_index_map(&sfc_index_map, Mb, Nb);
+  unsigned int index_tsize = sfc_ca_gemm_fill_sfc_index_map(&sfc_index_map, Mb, Nb, m_step, n_step);
   config->sfc_index_map = sfc_index_map;
   config->index_tsize = index_tsize;
 
@@ -197,12 +202,14 @@ gemm_config_t *setup_gemm_config(
   return config;
 }
 
+#ifdef USE_ONEDNN
 // oneDNN-specific setup function
 template <typename DType>
 gemm_config_t *setup_gemm_config_onednn(
     long M, long N, long K,
     long bm, long bn, long bk,
-    long &kbf, long &K_layers)
+    long &kbf, long &K_layers,
+    long m_step = 1, long n_step = 1)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -237,6 +244,8 @@ gemm_config_t *setup_gemm_config_onednn(
   config->bk = bk;
   config->K_layers = K_layers;
   config->brcount = brcount;
+  config->m_step = m_step;
+  config->n_step = n_step;
 
   // Allocate output_partial scratch buffers for K_layers > 1
   int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
@@ -255,9 +264,9 @@ gemm_config_t *setup_gemm_config_onednn(
   }
   config->gemm_scratch = (void *)output_partial_array;
 
-  // Create SFC index map
+  // Create SFC index map (coarsened SFC ordering baked into full Mb x Nb map)
   unsigned char *sfc_index_map = NULL;
-  unsigned int index_tsize = sfc_ca_gemm_fill_sfc_index_map(&sfc_index_map, Mb, Nb);
+  unsigned int index_tsize = sfc_ca_gemm_fill_sfc_index_map(&sfc_index_map, Mb, Nb, m_step, n_step);
   config->sfc_index_map = sfc_index_map;
   config->index_tsize = index_tsize;
 
@@ -341,6 +350,7 @@ gemm_config_t *setup_gemm_config_onednn(
 
   return config;
 }
+#endif // USE_ONEDNN
 
 // Null pointer check
 void check_null_ptr(void* ptr, const char* ptr_name) {
@@ -641,37 +651,54 @@ template<typename DType> void sfc_ca_gemm_matrix_copy_NC_to_NCNC(void *src, void
   }
 }
 
-unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb) {
-  long long i, n_tasks = Mb*Nb;
+unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb, unsigned int m_step, unsigned int n_step) {
+  unsigned int Mb_coarse = Mb / m_step, Nb_coarse = Nb / n_step;
+  long long n_coarse_tasks = Mb_coarse * Nb_coarse;
+  long long n_fine_tasks = (long long)Mb * Nb;
   int m_id, n_id;
   if (Mb < 256 && Nb < 256) {
     unsigned char *map;
-    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*Mb*Nb*sizeof(unsigned char), 2097152);
+    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*n_fine_tasks*sizeof(unsigned char), 2097152);
     map = (unsigned char*) *sfc_index_map;
-    for (i = 0; i < n_tasks; i++) {
-      gilbert_d2xy( &m_id, &n_id, i, Mb, Nb );
-      map[2*i+0] = (unsigned char)m_id;
-      map[2*i+1] = (unsigned char)n_id;
+    for (long long i = 0; i < n_coarse_tasks; i++) {
+      gilbert_d2xy( &m_id, &n_id, i, Mb_coarse, Nb_coarse );
+      for (unsigned int ms = 0; ms < m_step; ms++) {
+        for (unsigned int ns = 0; ns < n_step; ns++) {
+          long long fi = i * m_step * n_step + ms * n_step + ns;
+          map[2*fi+0] = (unsigned char)(m_id * m_step + ms);
+          map[2*fi+1] = (unsigned char)(n_id * n_step + ns);
+        }
+      }
     }
     return 1;
   } else if (Mb < 65536 && Nb < 65536) {
     unsigned short *map;
-    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*Mb*Nb*sizeof(unsigned short), 2097152);
+    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*n_fine_tasks*sizeof(unsigned short), 2097152);
     map = (unsigned short*) *sfc_index_map;
-    for (i = 0; i < n_tasks; i++) {
-      gilbert_d2xy( &m_id, &n_id, i, Mb, Nb );
-      map[2*i+0] = (unsigned short)m_id;
-      map[2*i+1] = (unsigned short)n_id;
+    for (long long i = 0; i < n_coarse_tasks; i++) {
+      gilbert_d2xy( &m_id, &n_id, i, Mb_coarse, Nb_coarse );
+      for (unsigned int ms = 0; ms < m_step; ms++) {
+        for (unsigned int ns = 0; ns < n_step; ns++) {
+          long long fi = i * m_step * n_step + ms * n_step + ns;
+          map[2*fi+0] = (unsigned short)(m_id * m_step + ms);
+          map[2*fi+1] = (unsigned short)(n_id * n_step + ns);
+        }
+      }
     }
     return 2;
   } else {
     unsigned int *map;
-    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*Mb*Nb*sizeof(unsigned int), 2097152);
+    *sfc_index_map = (unsigned char*) libxsmm_aligned_malloc( 2*n_fine_tasks*sizeof(unsigned int), 2097152);
     map = (unsigned int*) *sfc_index_map;
-    for (i = 0; i < n_tasks; i++) {
-      gilbert_d2xy( &m_id, &n_id, i, Mb, Nb );
-      map[2*i+0] = (unsigned int)m_id;
-      map[2*i+1] = (unsigned int)n_id;
+    for (long long i = 0; i < n_coarse_tasks; i++) {
+      gilbert_d2xy( &m_id, &n_id, i, Mb_coarse, Nb_coarse );
+      for (unsigned int ms = 0; ms < m_step; ms++) {
+        for (unsigned int ns = 0; ns < n_step; ns++) {
+          long long fi = i * m_step * n_step + ms * n_step + ns;
+          map[2*fi+0] = (unsigned int)(m_id * m_step + ms);
+          map[2*fi+1] = (unsigned int)(n_id * n_step + ns);
+        }
+      }
     }
     return 4;
   }
@@ -679,18 +706,15 @@ unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsig
 
 void sfc_ca_gemm_extract_indices_from_sfc(int *i_m, int *i_n, unsigned char *sfc_index_map, int sfc_index, unsigned int index_tsize) {
   if (index_tsize == 1) {
-    unsigned char *map;
-    map = (unsigned char*) sfc_index_map;
+    unsigned char *map = (unsigned char*) sfc_index_map;
     *i_m = (int) map[2*sfc_index + 0];
     *i_n = (int) map[2*sfc_index + 1];
   } else if (index_tsize == 2) {
-    unsigned short *map;
-    map = (unsigned short*) sfc_index_map;
+    unsigned short *map = (unsigned short*) sfc_index_map;
     *i_m = (int) map[2*sfc_index + 0];
     *i_n = (int) map[2*sfc_index + 1];
   } else {
-    unsigned int *map;
-    map = (unsigned int*) sfc_index_map;
+    unsigned int *map = (unsigned int*) sfc_index_map;
     *i_m = (int) map[2*sfc_index + 0];
     *i_n = (int) map[2*sfc_index + 1];
   }
