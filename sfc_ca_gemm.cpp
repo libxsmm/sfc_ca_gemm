@@ -40,6 +40,21 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
   long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
   long K_rounds_per_layer = (Kb_per_layer + brcount - 1) / brcount;
+
+  // Upfront packing of B from flat to blocked (unblocked_bc == 2)
+  if (unblocked_bc == 2) {
+    DType *scratch_B_buf = (DType *)config->scratch_B;
+    libxsmm_meltwfunction_unary b_xform_kernel = config->b_xform_kernel;
+    #pragma omp parallel for collapse(2)
+    for (int i_n = 0; i_n < Nb; i_n++) {
+      for (int i_k = 0; i_k < Kb; i_k++) {
+        libxsmm_meltw_unary_param xform_param;
+        xform_param.in.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk);
+        xform_param.out.primary = (void *)((DType *)scratch_B_buf + i_n * K * bn + i_k * bk * bn);
+        b_xform_kernel(&xform_param);
+      }
+    }
+  }
   
 #pragma omp parallel
   {
@@ -64,7 +79,9 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         }
         gemm_param.op.tertiary = (void *)&brcount_use;
         gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
-        if (unblocked_bc > 0) {
+        if (unblocked_bc == 2) {
+          gemm_param.b.primary = (void *)((DType *)config->scratch_B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
+        } else if (unblocked_bc == 1) {
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk + i_k_layer * Kb_per_layer * bk);
         } else {
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
@@ -424,6 +441,10 @@ int gemm_benchmark(int argc, char** argv) {
   // Free config buffers
   if (gemm_cfg->sfc_index_map != NULL) {
     libxsmm_free(gemm_cfg->sfc_index_map);
+  }
+
+  if (gemm_cfg->scratch_B != NULL) {
+    libxsmm_free(gemm_cfg->scratch_B);
   }
 
   CType **output_partial_array = (CType**)gemm_cfg->gemm_scratch;
