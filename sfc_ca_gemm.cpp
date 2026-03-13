@@ -27,6 +27,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   // Unpack configuration struct
   using CType = typename output_type<DType>::type;
   long M = config->M, N = config->N, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb, bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
+  long unblocked_bc = config->unblocked_bc;
   CType **scratch_C = (CType**)config->gemm_scratch;
   unsigned char *sfc_index_map = config->sfc_index_map;
   unsigned int index_tsize = config->index_tsize;
@@ -63,9 +64,18 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         }
         gemm_param.op.tertiary = (void *)&brcount_use;
         gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
-        gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
-        gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
-                                               : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+        if (unblocked_bc > 0) {
+          gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk + i_k_layer * Kb_per_layer * bk);
+        } else {
+          gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
+        }
+        if (unblocked_bc > 0) {
+          gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bm)
+                                                 : (void *)((CType *)C + i_n * M * bn + i_m * bm);
+        } else {
+          gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
+                                                 : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
+        }
         if ((i_k == 0) && (K_rounds_per_layer != 1)){
           libxsmm_meltw_unary_param zero_param;
           zero_param.out.primary = (void*)gemm_param.c.primary;
@@ -86,21 +96,40 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_red, index_tsize);
         if (K_layers == 2) {
           libxsmm_meltw_binary_param add_param;
-          add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+          if (unblocked_bc > 0) {
+            add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bm );
+            add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bm );
+            add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm );
+          } else {
+            add_param.in0.primary  = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+            add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+            add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+          }
           l_add_kernel(&add_param);
         } else {
           libxsmm_meltw_binary_param add_param;
           libxsmm_meltw_unary_param reduce_param;
-          CType reduce_scratch[bm*bn];
-          reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
-          reduce_param.out.primary  = (void*)reduce_scratch;
-          add_param.in0.primary  = (void*)reduce_scratch;
-          add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );       
-          add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
-          l_reduce_kernel(&reduce_param);
-          l_add_kernel(&add_param);
+          if (unblocked_bc > 0) {
+            CType reduce_scratch[bm];
+            for (long l_in = 0; l_in < bn; l_in++) {
+              reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bm + l_in * M);
+              reduce_param.out.primary = (void*)reduce_scratch;
+              add_param.in0.primary = (void*)reduce_scratch;
+              add_param.in1.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+              add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+              l_reduce_kernel(&reduce_param);
+              l_add_kernel(&add_param);
+            }
+          } else {
+            CType reduce_scratch[bm*bn];
+            reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
+            reduce_param.out.primary  = (void*)reduce_scratch;
+            add_param.in0.primary  = (void*)reduce_scratch;
+            add_param.in1.primary  = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+            add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bn * bm );
+            l_reduce_kernel(&reduce_param);
+            l_add_kernel(&add_param);
+          }
         }
       }
     }
@@ -139,6 +168,7 @@ int gemm_benchmark(int argc, char** argv) {
   long i;
   long check_correctness = 0;
   long m_step = 1, n_step = 1;
+  long unblocked_bc = 0;
 
   ifreq = 1.0 / getFreq();
   // Read command line arguments
@@ -189,6 +219,9 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 14) {
       n_step = atoi(argv[14]);
+    }
+    if (argc > 15) {
+      unblocked_bc = atoi(argv[15]);
     }
   }
   
@@ -249,8 +282,13 @@ int gemm_benchmark(int argc, char** argv) {
   }
   for (i = 0; i < n_layers; i++) {
     sfc_ca_gemm_matrix_copy_KC_to_KCCK<DType>( (void*)naive_a_lp, (void*)A[i], K, M, bk, bm);
-    sfc_ca_gemm_matrix_copy_NC_to_NCNC<DType>( (void*)naive_b_lp, (void*)B[i] , N, K, bn, bk);
-    sfc_ca_gemm_matrix_copy_NC_to_NCNC<CType>( (void*)naive_c_lp, (void*)C[i], N, M, bn, bm);
+    if (unblocked_bc > 0) {
+      memcpy((void *)B[i], (void *)naive_b_lp, N*K*sizeof(DType));
+      memcpy((void *)C[i], (void *)naive_c_lp, N*M*sizeof(CType));
+    } else {
+      sfc_ca_gemm_matrix_copy_NC_to_NCNC<DType>( (void*)naive_b_lp, (void*)B[i] , N, K, bn, bk);
+      sfc_ca_gemm_matrix_copy_NC_to_NCNC<CType>( (void*)naive_c_lp, (void*)C[i], N, M, bn, bm);
+    }
   }
   
   // Compute reference if requested
@@ -266,7 +304,7 @@ int gemm_benchmark(int argc, char** argv) {
   } 
   
   // Setup GEMM configuration
-  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step);
+  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc);
 
   // Warmup iteration
   run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
@@ -280,7 +318,11 @@ int gemm_benchmark(int argc, char** argv) {
     libxsmm_matdiff_info norms, diff;
     libxsmm_matdiff_clear(&norms);
     libxsmm_matdiff_clear(&diff);
-    sfc_ca_gemm_matrix_copy_NCNC_to_NC<CType>( (void*)C[n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
+    if (unblocked_bc > 0) {
+      memcpy((void *)naive_c_lp, (void *)C[n_layers-1], N*M*sizeof(CType));
+    } else {
+      sfc_ca_gemm_matrix_copy_NCNC_to_NC<CType>( (void*)C[n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
+    }
     sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c_opt, N*M );
     printf("##########################################\n");
     printf("#           Correctness                  #\n");

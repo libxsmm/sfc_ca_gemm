@@ -103,6 +103,7 @@ typedef struct
   libxsmm_meltwfunction_binary l_add_kernel;
   libxsmm_meltwfunction_unary l_reduce_kernel;
   long m_step, n_step;  // SFC coarsening step sizes (default 1)
+  long unblocked_bc;     // 0 = blocked activations (NCNC), 1 = flat activations (NC)
   // oneDNN-specific fields
   void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
   size_t onednn_scratchpad_size;
@@ -114,7 +115,8 @@ gemm_config_t *setup_gemm_config(
     long M, long N, long K,
     long bm, long bn, long bk,
     long &kbf, long &K_layers,
-    long m_step = 1, long n_step = 1)
+    long m_step = 1, long n_step = 1,
+    long unblocked_bc = 0)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -151,6 +153,7 @@ gemm_config_t *setup_gemm_config(
   config->brcount = brcount;
   config->m_step = m_step;
   config->n_step = n_step;
+  config->unblocked_bc = unblocked_bc;
 
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
@@ -185,18 +188,18 @@ gemm_config_t *setup_gemm_config(
   auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
-  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_out, dtype_comp);
+  auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, (unblocked_bc > 0) ? K : bk, (unblocked_bc > 0) ? M : bm, dtype, dtype, dtype_out, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
-  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), bk * bn * sizeof(DType), brcount);
-  auto l_unary_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_out, dtype_out, dtype_comp);
+  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc > 0) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
+  auto l_unary_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, (unblocked_bc > 0) ? bn : 1, (unblocked_bc > 0) ? M : bm * bn, (unblocked_bc > 0) ? M : bm * bn, dtype_out, dtype_out, dtype_comp);
   if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
-  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, bn, bm, bm, bm, dtype_out, dtype_out, dtype_out, dtype_comp);
+  auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, (unblocked_bc == 0) ? bn : ((K_layers > 2) ? 1 : bn), (unblocked_bc > 0) ? M : bm, (unblocked_bc > 0) ? M : bm, (unblocked_bc > 0) ? M : bm, dtype_out, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
-  auto l_reduce_shape = libxsmm_create_meltw_unary_shape(bm * bn, n_out_copies, M * N, bm * bn, dtype_out, dtype_out, dtype_comp);
+  auto l_reduce_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, n_out_copies, M * N, (unblocked_bc > 0) ? bm : bm * bn, dtype_out, dtype_out, dtype_comp);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
 
   return config;
