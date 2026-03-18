@@ -238,6 +238,7 @@ int gemm_benchmark(int argc, char** argv) {
   long check_correctness = 0;
   long m_step = 1, n_step = 1;
   long unblocked_bc = 0;
+  long use_nts = 0;
 
   ifreq = 1.0 / getFreq();
   // Read command line arguments
@@ -291,6 +292,9 @@ int gemm_benchmark(int argc, char** argv) {
     }
     if (argc > 15) {
       unblocked_bc = atoi(argv[15]);
+    }
+    if (argc > 16) {
+      use_nts = atoi(argv[16]);
     }
   }
 
@@ -386,7 +390,7 @@ int gemm_benchmark(int argc, char** argv) {
   } 
   
   // Setup GEMM configuration
-  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc);
+  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, use_nts);
 
   // Warmup iteration
   run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
@@ -433,7 +437,7 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective A sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
   printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
-  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_stepM_%ld_stepN_%ld_act_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, omp_get_max_threads());
+  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_stepM_%ld_stepN_%ld_act_%ld_nts_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, use_nts, omp_get_max_threads());
 
 #ifdef PRINT_THREAD_WORK_ASSIGNMENT
   // We run foo loop to capture work assignment thread_work_t

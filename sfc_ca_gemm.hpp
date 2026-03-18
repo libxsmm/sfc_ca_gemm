@@ -122,7 +122,8 @@ gemm_config_t *setup_gemm_config(
     long bm, long bn, long bk,
     long &kbf, long &K_layers,
     long m_step = 1, long n_step = 1,
-    long unblocked_bc = 0)
+    long unblocked_bc = 0,
+    long use_nts = 0)
 {
   gemm_config_t *config = new gemm_config_t();
   // Calculate derived parameters
@@ -199,6 +200,7 @@ gemm_config_t *setup_gemm_config(
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, (unblocked_bc > 0) ? bn : 1, (unblocked_bc > 0) ? M : bm * bn, (unblocked_bc > 0) ? M : bm * bn, dtype_out, dtype_out, dtype_comp);
   if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
+  if (use_nts > 0) l_flags |= LIBXSMM_GEMM_FLAG_ALIGN_C_NTS_HINT;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);

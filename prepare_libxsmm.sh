@@ -76,8 +76,8 @@ echo "Building LIBXSMM..."
 echo "Switching to ${BRANCH} branch..."
 git pull
 #git checkout $BRANCH
-git checkout ea0b20499a41377bab148257240adbbfe1b4a333
-git apply ../libxsmm_i32.patch
+#git checkout ea0b20499a41377bab148257240adbbfe1b4a333
+#git apply ../libxsmm_i32.patch
 
 echo ""
 echo "Compiling LIBXSMM (this may take a few minutes)..."
