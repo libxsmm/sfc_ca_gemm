@@ -26,6 +26,7 @@
 #include <string.h>
 #include <cmath>
 #include <omp.h>
+#include <immintrin.h>
 #include <libxsmm.h>
 #include <libxsmm_utils.h>
 #include "sfc_utils.h"

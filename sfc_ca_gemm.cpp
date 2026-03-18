@@ -11,6 +11,8 @@
 
 #include "sfc_ca_gemm.hpp"
 
+#define REDUCTION_N_UNROLL 8
+
 #define PRINT_THREAD_WORK_ASSIGNMENT
 
 // Define struct to store work per thread
@@ -127,15 +129,65 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           libxsmm_meltw_binary_param add_param;
           libxsmm_meltw_unary_param reduce_param;
           if (unblocked_bc > 0) {
-            CType reduce_scratch[bm];
-            for (long l_in = 0; l_in < bn; l_in++) {
-              reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bm + l_in * M);
-              reduce_param.out.primary = (void*)reduce_scratch;
-              add_param.in0.primary = (void*)reduce_scratch;
-              add_param.in1.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
-              add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
-              l_reduce_kernel(&reduce_param);
-              l_add_kernel(&add_param);
+            // Check for AVX-512 BF16 specialized path (bm=32, bn=32, BF16 output)
+            if constexpr (sizeof(CType) == 2) {
+              if (bm == 32 && bn == 32) {
+                // AVX-512 vectorized reduction for 32x32 BF16 blocks
+                // Unrolls by REDUCTION_N_UNROLL rows in N → 2*REDUCTION_N_UNROLL ZMM FP32 accumulators
+                long base_off = i_n * M * bn + i_m * bm;
+                int n_copies = K_layers - 1;
+                for (long l_batch = 0; l_batch < 32; l_batch += REDUCTION_N_UNROLL) {
+                  __m512 acc[2*REDUCTION_N_UNROLL];
+                  // Load first scratch copy (512-bit load per row), convert BF16→FP32
+                  for (int r = 0; r < REDUCTION_N_UNROLL; r++) {
+                    CType *src = (CType*)scratch_C[0] + base_off + (l_batch + r) * M;
+                    __m512i row = _mm512_loadu_si512((__m512i*)(src));
+                    acc[2*r]   = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(row)), 16));
+                    acc[2*r+1] = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(row, 1)), 16));
+                  }
+                  // Accumulate remaining scratch copies
+                  for (int k = 1; k < n_copies; k++) {
+                    for (int r = 0; r < REDUCTION_N_UNROLL; r++) {
+                      CType *src = (CType*)scratch_C[k] + base_off + (l_batch + r) * M;
+                      __m512i row = _mm512_loadu_si512((__m512i*)(src));
+                      acc[2*r]   = _mm512_add_ps(acc[2*r],   _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(row)), 16)));
+                      acc[2*r+1] = _mm512_add_ps(acc[2*r+1], _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(row, 1)), 16)));
+                    }
+                  }
+                  // Add to C and convert FP32→BF16 (round-to-nearest-even)
+                  for (int r = 0; r < REDUCTION_N_UNROLL; r++) {
+                    CType *c_ptr = (CType*)C + base_off + (l_batch + r) * M;
+                    __m512i c_row = _mm512_loadu_si512((__m512i*)(c_ptr));
+                    acc[2*r]   = _mm512_add_ps(acc[2*r],   _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_castsi512_si256(c_row)), 16)));
+                    acc[2*r+1] = _mm512_add_ps(acc[2*r+1], _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm512_extracti64x4_epi64(c_row, 1)), 16)));
+                    // RNE FP32→BF16 conversion (VCVTNE2PS2BF16) and 512-bit store
+                    __m512bh out_row = _mm512_cvtne2ps_pbh(acc[2*r+1], acc[2*r]);
+                    _mm512_storeu_si512((__m512i*)(c_ptr), (__m512i)out_row);
+                  }
+                }
+              } else {
+                CType reduce_scratch[bm];
+                for (long l_in = 0; l_in < bn; l_in++) {
+                  reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bm + l_in * M);
+                  reduce_param.out.primary = (void*)reduce_scratch;
+                  add_param.in0.primary = (void*)reduce_scratch;
+                  add_param.in1.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+                  add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+                  l_reduce_kernel(&reduce_param);
+                  l_add_kernel(&add_param);
+                }
+              }
+            } else {
+              CType reduce_scratch[bm];
+              for (long l_in = 0; l_in < bn; l_in++) {
+                reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bm + l_in * M);
+                reduce_param.out.primary = (void*)reduce_scratch;
+                add_param.in0.primary = (void*)reduce_scratch;
+                add_param.in1.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+                add_param.out.primary = (void*)((CType*)C + i_n * M * bn + i_m * bm + l_in * M);
+                l_reduce_kernel(&reduce_param);
+                l_add_kernel(&add_param);
+              }
             }
           } else {
             CType reduce_scratch[bm*bn];
