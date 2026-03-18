@@ -35,7 +35,7 @@ endif
 
 ifeq ($(SFC_CA_GEMM_COMPILER),icx)
   CXX := icpx
-  CXXFLAGS := -qopenmp -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2 -Wno-vla-cxx-extension
+  CXXFLAGS := -qopenmp -xgraniterapids -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17 -O2 -Wno-vla-cxx-extension
 endif
 
 LDFLAGS = -Wl,-rpath,'$(LIBXSMM_ROOT)/lib'

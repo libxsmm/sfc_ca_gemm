@@ -241,7 +241,20 @@ int gemm_benchmark(int argc, char** argv) {
       unblocked_bc = atoi(argv[15]);
     }
   }
-  
+
+  /* If any of kbf, K_layers, m_step, n_step, unblocked_bc is -1, apply H9 heuristic (size-bin lookup) */
+  if (kbf == -1 || K_layers == -1 || m_step == -1 || n_step == -1 || unblocked_bc == -1) {
+    long h_kbf, h_K_layers, h_m_step, h_n_step, h_flat;
+    sfc_heuristic_h9(M, N, K, bm, bn, bk, &h_kbf, &h_K_layers, &h_m_step, &h_n_step, &h_flat);
+    if (kbf == -1)          kbf = h_kbf;
+    if (K_layers == -1)     K_layers = h_K_layers;
+    if (m_step == -1)       m_step = h_m_step;
+    if (n_step == -1)       n_step = h_n_step;
+    if (unblocked_bc == -1) unblocked_bc = h_flat;
+    printf("Heuristic H9 (size-bin): kbf=%ld K_layers=%ld m_step=%ld n_step=%ld flat=%ld\n",
+           kbf, K_layers, m_step, n_step, unblocked_bc);
+  }
+
   long Mb = M/bm, Nb = N/bn, Kb = K/bk;
   // Allocate buffers
   DType **B = (DType**) malloc(n_layers*sizeof(DType*));
@@ -368,7 +381,7 @@ int gemm_benchmark(int argc, char** argv) {
   printf("Effective A sizes: %.5g GB\n", ((double)sizeof(DType)*(double)n_layers*(double)M*(double)K)/(1024.0*1024.0*1024.0));
   printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
-  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, omp_get_max_threads());
+  printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_stepM_%ld_stepN_%ld_act_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, omp_get_max_threads());
 
 #ifdef PRINT_THREAD_WORK_ASSIGNMENT
   // We run foo loop to capture work assignment thread_work_t

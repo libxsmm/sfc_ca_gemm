@@ -171,7 +171,15 @@ int gemm_benchmark(int argc, char** argv) {
       n_step = atoi(argv[14]);
     }
   }
-  
+
+  /* If any of kbf, K_layers, m_step, n_step is -1, apply H9 heuristic */
+  if (kbf == -1 || K_layers == -1 || m_step == -1 || n_step == -1) {
+    long h_flat;
+    sfc_heuristic_h9(M, N, K, bm, bn, bk, &kbf, &K_layers, &m_step, &n_step, &h_flat);
+    printf("Heuristic H9 (size-bin): kbf=%ld K_layers=%ld m_step=%ld n_step=%ld flat=%ld\n",
+           kbf, K_layers, m_step, n_step, h_flat);
+  }
+
   long Mb = M/bm, Nb = N/bn, Kb = K/bk;
   // Allocate buffers
   DType **BC = (DType**) malloc((2*n_layers)*sizeof(DType*));

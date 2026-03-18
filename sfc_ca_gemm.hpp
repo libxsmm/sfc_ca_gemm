@@ -29,8 +29,11 @@
 #include <libxsmm.h>
 #include <libxsmm_utils.h>
 #include "sfc_utils.h"
+#include "sfc_ca_gemm_heuristics.h"
+#include "sfc_ca_gemm_heuristics.h"
+// ALIGNEMNET SIZE is 2 MB
 
-#define ALIGNMENT_SIZE 64
+#define ALIGNMENT_SIZE (2 * 1024 * 1024)
 
 // Forward declarations
 template<typename DType> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype();
@@ -187,7 +190,7 @@ gemm_config_t *setup_gemm_config(
   // Computation type: I32 for I8 inputs, F64 for F64 inputs, F32 for BF16/FP32
   auto dtype_comp = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_I32 : 
                     (dtype == LIBXSMM_DATATYPE_F64) ? LIBXSMM_DATATYPE_F64 : LIBXSMM_DATATYPE_F32;
-  auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
+  auto l_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_FLAG_A_UNSIGNED;
   auto l_tc_flags = LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, (unblocked_bc == 1) ? K : bk, (unblocked_bc > 0) ? M : bm, dtype, dtype, dtype_out, dtype_comp);
@@ -209,7 +212,9 @@ gemm_config_t *setup_gemm_config(
   config->b_xform_kernel = NULL;
   if (unblocked_bc == 2) {
     config->scratch_B = (void *)libxsmm_aligned_malloc((size_t)K * (size_t)N * sizeof(DType), ALIGNMENT_SIZE);
-    auto xform_unary_shape = libxsmm_create_meltw_unary_shape(bk, bn, K, bk, dtype, dtype, dtype);
+    // Use BF8 instead of I8 for the copy kernel since libxsmm doesn't support I8 meltw identity
+    auto xform_dtype = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_BF8 : dtype;
+    auto xform_unary_shape = libxsmm_create_meltw_unary_shape(bk, bn, K, bk, xform_dtype, xform_dtype, xform_dtype);
     config->b_xform_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_IDENTITY, xform_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   }
 
