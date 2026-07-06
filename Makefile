@@ -53,13 +53,14 @@ TARGET = sfc_ca_gemm
 TARGET_ONEDNN = sfc_ca_onednn_gemm
 SOURCES = sfc_ca_gemm.cpp
 SOURCES_ONEDNN = sfc_ca_onednn_gemm.cpp
+PREDICTOR_SOURCES = knn_model.c knn_model_emr.c knn_model_gnr.c roofline_predictor.c
 HEADERS = sfc_ca_gemm.hpp sfc_utils.h
 
 .PHONY: all
 all: $(TARGET) $(TARGET_ONEDNN)
 
-$(TARGET): $(SOURCES) $(HEADERS)
-	$(CXX) $(CXXFLAGS) $(IFLAGS) $(SOURCES) $(LFLAGS) $(LDFLAGS) -lxsmm -o $@
+$(TARGET): $(SOURCES) $(PREDICTOR_SOURCES) $(HEADERS)
+	$(CXX) $(CXXFLAGS) $(IFLAGS) $(SOURCES) $(PREDICTOR_SOURCES) $(LFLAGS) $(LDFLAGS) -lxsmm -o $@
 
 $(TARGET_ONEDNN): $(SOURCES_ONEDNN) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES_ONEDNN) $(LFLAGS) $(ONEDNN_LFLAGS) $(LDFLAGS) $(ONEDNN_LDFLAGS) -lxsmm -ldnnl -o $@

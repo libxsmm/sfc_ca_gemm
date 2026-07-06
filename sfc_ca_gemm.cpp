@@ -11,6 +11,11 @@
 
 #include "sfc_ca_gemm.hpp"
 
+extern "C" {
+  #include "knn_model.h"
+  #include "roofline_predictor.h"
+}
+
 #define REDUCTION_N_UNROLL 8
 
 #define PRINT_THREAD_WORK_ASSIGNMENT
@@ -296,6 +301,36 @@ int gemm_benchmark(int argc, char** argv) {
     if (argc > 16) {
       use_nts = atoi(argv[16]);
     }
+  }
+
+  /* If kbf == -2 and K_layers == -2, use roofline model predictor (predicts K_layers / c_copies and nstep1) */
+  if (kbf == -2 && K_layers == -2) {
+    int predicted_kbf, predicted_K_layers;
+    long long hw_threads, hw_bm, hw_bn, hw_c_copies_limit;
+    double hw_bw_per_core, hw_c_bw_per_core, hw_compute_per_core;
+    get_platform_roofline_params(
+        &hw_threads, &hw_bm, &hw_bn,
+        &hw_bw_per_core, &hw_c_bw_per_core, &hw_compute_per_core,
+        &hw_c_copies_limit
+    );
+    predict_config_roofline(
+        M, N, K, &predicted_kbf, &predicted_K_layers,
+        hw_threads, hw_bm, hw_bn,
+        hw_bw_per_core, hw_c_bw_per_core, hw_compute_per_core,
+        hw_c_copies_limit
+    );
+    kbf = predicted_kbf;
+    K_layers = predicted_K_layers;
+    printf("Roofline Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
+  }
+
+  /* If kbf == -3 and K_layers == -3, use k-NN predictor */
+  if (kbf == -3 && K_layers == -3) {
+    int predicted_kbf, predicted_K_layers;
+    predict_config_knn((int)M, (int)N, (int)K, &predicted_kbf, &predicted_K_layers);
+    kbf = predicted_kbf;
+    K_layers = predicted_K_layers;
+    printf("k-NN Model Prediction: M=%ld N=%ld K=%ld -> kbf=%ld, K_layers=%ld\n", M, N, K, kbf, K_layers);
   }
 
   /* If any of kbf, K_layers, m_step, n_step, unblocked_bc is -1, apply H9 heuristic (size-bin lookup) */
