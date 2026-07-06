@@ -114,6 +114,11 @@ typedef struct
   void *onednn_brgemm_kernel;  // dnnl::ukernel::brgemm*
   size_t onednn_scratchpad_size;
   void *onednn_A_B_offsets_ptrs;  // thread-local offset vectors
+  // I8 -> F32 dequantization fields (I8F32 variant)
+  long dequant_f32;                    // 0 = disabled, 1 = dequant I32 accumulator to F32 at block output
+  void *a_scales;                      // per-M scales (size M), applied to A
+  void *b_scales;                      // per-N scales (size N), applied to B
+  libxsmm_meqn_function dequant_kernel; // TPP equation: out_f32 = (a_scale x b_scale) * i32_acc
 } gemm_config_t;
 
 template <typename DType>
@@ -123,9 +128,11 @@ gemm_config_t *setup_gemm_config(
     long &kbf, long &K_layers,
     long m_step = 1, long n_step = 1,
     long unblocked_bc = 0,
-    long use_nts = 0)
+    long use_nts = 0,
+    long dequant_f32 = 0)
 {
   gemm_config_t *config = new gemm_config_t();
+
   // Calculate derived parameters
   long Mb = M / bm, Nb = N / bn, Kb = K / bk;
 
@@ -209,6 +216,40 @@ gemm_config_t *setup_gemm_config(
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, n_out_copies, M * N, (unblocked_bc > 0) ? bm : bm * bn, dtype_out, dtype_out, dtype_comp);
   config->l_reduce_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_REDUCE_X_OP_ADD, l_reduce_shape, LIBXSMM_MELTW_FLAG_UNARY_REDUCE_COLS);
+
+  // Setup dequantization equation for I8 -> F32 output (I8F32 variant).
+  // At the block output level we compute: out_f32 = (a_scale[m] * b_scale[n]) * i32_acc[m][n]
+  config->dequant_f32 = dequant_f32;
+  config->a_scales = NULL;
+  config->b_scales = NULL;
+  config->dequant_kernel = NULL;
+  if (dequant_f32 && dtype == LIBXSMM_DATATYPE_I8) {
+    long c_ld = (unblocked_bc > 0) ? M : bm;
+    libxsmm_matrix_arg_attributes arg_singular_attr = libxsmm_create_matrix_arg_attributes(LIBXSMM_MATRIX_ARG_TYPE_SINGULAR, LIBXSMM_MATRIX_ARG_SET_TYPE_NONE, 0, 0);
+    libxsmm_blasint my_eqn = libxsmm_meqn_create();
+    libxsmm_meqn_op_metadata  op_metadata = libxsmm_create_meqn_op_metadata(my_eqn, -1);
+    libxsmm_meqn_arg_metadata arg_metadata;
+    libxsmm_meqn_arg_shape    arg_shape_in, arg_shape_out;
+    // Top op: out = scale_matrix * i32_acc
+    libxsmm_meqn_push_back_binary_op(op_metadata, LIBXSMM_MELTW_TYPE_BINARY_MUL, LIBXSMM_DATATYPE_F32, LIBXSMM_MELTW_FLAG_BINARY_NONE);
+    // Inner op: scale_matrix = a_scales(bm x 1) * b_scales(1 x bn)
+    libxsmm_meqn_push_back_binary_op(op_metadata, LIBXSMM_MELTW_TYPE_BINARY_MUL, LIBXSMM_DATATYPE_F32, LIBXSMM_MELTW_FLAG_BINARY_BCAST_COL_IN_0 | LIBXSMM_MELTW_FLAG_BINARY_BCAST_ROW_IN_1);
+    // arg 0: a_scales (bm, 1)
+    arg_shape_in = libxsmm_create_meqn_arg_shape(bm, 1, bm, LIBXSMM_DATATYPE_F32);
+    arg_metadata = libxsmm_create_meqn_arg_metadata(my_eqn, 0);
+    libxsmm_meqn_push_back_arg(arg_metadata, arg_shape_in, arg_singular_attr);
+    // arg 1: b_scales (1, bn)
+    arg_shape_in = libxsmm_create_meqn_arg_shape(1, bn, 1, LIBXSMM_DATATYPE_F32);
+    arg_metadata = libxsmm_create_meqn_arg_metadata(my_eqn, 1);
+    libxsmm_meqn_push_back_arg(arg_metadata, arg_shape_in, arg_singular_attr);
+    // arg 2: I32 accumulator block (bm, bn, ld=c_ld)
+    arg_shape_in = libxsmm_create_meqn_arg_shape(bm, bn, c_ld, LIBXSMM_DATATYPE_I32);
+    arg_metadata = libxsmm_create_meqn_arg_metadata(my_eqn, 2);
+    libxsmm_meqn_push_back_arg(arg_metadata, arg_shape_in, arg_singular_attr);
+    // output: F32 block (bm, bn, ld=c_ld)
+    arg_shape_out = libxsmm_create_meqn_arg_shape(bm, bn, c_ld, LIBXSMM_DATATYPE_F32);
+    config->dequant_kernel = libxsmm_dispatch_meqn(my_eqn, arg_shape_out);
+  }
 
   // Setup upfront packing for B (unblocked_bc == 2)
   config->scratch_B = NULL;

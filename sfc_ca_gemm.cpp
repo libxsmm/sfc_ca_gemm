@@ -108,6 +108,18 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         if (brcount_use > 0) {
           brgemm_kernel( &gemm_param );
         }
+        // Fused I8 -> F32 dequant when K_layers == 1: apply at the final kbf round,
+        // when the I32 accumulator for this block is complete.
+        if (config->dequant_f32 && K_layers == 1 && (i_k + brcount >= Kb_per_layer)) {
+          libxsmm_meqn_param eqn_param;
+          libxsmm_matrix_arg arg_array[3];
+          arg_array[0].primary = (void*)((float*)config->a_scales + i_m * bm);
+          arg_array[1].primary = (void*)((float*)config->b_scales + i_n * bn);
+          arg_array[2].primary = gemm_param.c.primary;
+          eqn_param.inputs = arg_array;
+          eqn_param.output.primary = gemm_param.c.primary;
+          config->dequant_kernel(&eqn_param);
+        }
       }
     }
     if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
@@ -205,6 +217,21 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
             l_add_kernel(&add_param);
           }
         }
+        // Fused I8 -> F32 dequant when K_layers > 1: apply right after the reduction
+        // has produced the complete I32 result for this block.
+        if (config->dequant_f32) {
+          void *c_block_ptr = (unblocked_bc > 0)
+              ? (void*)((CType*)C + i_n * M * bn + i_m * bm)
+              : (void*)((CType*)C + i_n * M * bn + i_m * bn * bm);
+          libxsmm_meqn_param eqn_param;
+          libxsmm_matrix_arg arg_array[3];
+          arg_array[0].primary = (void*)((float*)config->a_scales + i_m * bm);
+          arg_array[1].primary = (void*)((float*)config->b_scales + i_n * bn);
+          arg_array[2].primary = c_block_ptr;
+          eqn_param.inputs = arg_array;
+          eqn_param.output.primary = c_block_ptr;
+          config->dequant_kernel(&eqn_param);
+        }
       }
     }
   }
@@ -230,7 +257,7 @@ void run_gemm_n_layers_no_reduction(long n_layers, gemm_config_t *config, DType 
 }
 
 template<typename DType>
-int gemm_benchmark(int argc, char** argv) {
+int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   using CType = typename output_type<DType>::type;
   // Setup default GEMM sizes
   long M = 1024*4, N = 1024*4, K = 1024*4;
@@ -378,6 +405,18 @@ int gemm_benchmark(int argc, char** argv) {
   check_null_ptr(naive_c_lp, "naive_c_lp array");
   DType *naive_a_lp = (DType*)libxsmm_aligned_malloc( M*K*sizeof(DType), ALIGNMENT_SIZE);
   check_null_ptr(naive_a_lp, "naive_a_lp array");
+
+  // Allocate and initialize per-M / per-N dequant scales (I8F32 variant)
+  float *a_scales = NULL;
+  float *b_scales = NULL;
+  if (dequant_f32) {
+    a_scales = (float*)libxsmm_aligned_malloc( M*sizeof(float), ALIGNMENT_SIZE);
+    check_null_ptr(a_scales, "a_scales array");
+    b_scales = (float*)libxsmm_aligned_malloc( N*sizeof(float), ALIGNMENT_SIZE);
+    check_null_ptr(b_scales, "b_scales array");
+    for (long im = 0; im < M; im++) a_scales[im] = 0.001f + (float)(rand() % 100) / 100000.0f;
+    for (long in = 0; in < N; in++) b_scales[in] = 0.001f + (float)(rand() % 100) / 100000.0f;
+  }
   
   // Init buffers - for I8, initialize directly; for others, use float conversion
   if (std::is_same<DType, char>::value) {
@@ -420,12 +459,26 @@ int gemm_benchmark(int argc, char** argv) {
     naive_param.M = M;
     naive_param.fuse_type = 0;
     naive_gemm_fp(&naive_param, naive_b, naive_c, naive_a);
-    sfc_ca_gemm_rne_convert_fp32_lp<CType>( naive_c,     (void*)naive_c_lp, (N*M) );
-    sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c, N*M);
+    if (dequant_f32) {
+      // Reference for I8F32: dequantize the exact I32 result with the per-M/per-N scales.
+      // naive_c is stored as [N][M] (c[n*M + m]).
+      for (long in = 0; in < N; in++) {
+        for (long im = 0; im < M; im++) {
+          naive_c[in * M + im] *= a_scales[im] * b_scales[in];
+        }
+      }
+    } else {
+      sfc_ca_gemm_rne_convert_fp32_lp<CType>( naive_c,     (void*)naive_c_lp, (N*M) );
+      sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c, N*M);
+    }
   } 
   
   // Setup GEMM configuration
-  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, use_nts);
+  gemm_config_t *gemm_cfg = setup_gemm_config<DType>(M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, use_nts, dequant_f32 ? 1 : 0);
+  if (dequant_f32) {
+    gemm_cfg->a_scales = (void*)a_scales;
+    gemm_cfg->b_scales = (void*)b_scales;
+  }
 
   // Warmup iteration
   run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
@@ -439,12 +492,21 @@ int gemm_benchmark(int argc, char** argv) {
     libxsmm_matdiff_info norms, diff;
     libxsmm_matdiff_clear(&norms);
     libxsmm_matdiff_clear(&diff);
-    if (unblocked_bc > 0) {
-      memcpy((void *)naive_c_lp, (void *)C[n_layers-1], N*M*sizeof(CType));
+    if (dequant_f32) {
+      // C already holds F32 (dequantized); copy/de-block directly as F32.
+      if (unblocked_bc > 0) {
+        memcpy((void *)naive_c_opt, (void *)C[n_layers-1], N*M*sizeof(float));
+      } else {
+        sfc_ca_gemm_matrix_copy_NCNC_to_NC<float>( (void*)C[n_layers-1], (void*)naive_c_opt, N, M, bn, bm );
+      }
     } else {
-      sfc_ca_gemm_matrix_copy_NCNC_to_NC<CType>( (void*)C[n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
+      if (unblocked_bc > 0) {
+        memcpy((void *)naive_c_lp, (void *)C[n_layers-1], N*M*sizeof(CType));
+      } else {
+        sfc_ca_gemm_matrix_copy_NCNC_to_NC<CType>( (void*)C[n_layers-1], (void*)naive_c_lp, N, M, bn, bm );
+      }
+      sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c_opt, N*M );
     }
-    sfc_ca_gemm_convert_lp_f32<CType>( (void*)naive_c_lp, naive_c_opt, N*M );
     printf("##########################################\n");
     printf("#           Correctness                  #\n");
     printf("##########################################\n");
@@ -537,6 +599,8 @@ int gemm_benchmark(int argc, char** argv) {
   libxsmm_free(naive_b_lp);
   libxsmm_free(naive_c_lp);
   libxsmm_free(naive_a_lp);
+  if (a_scales != NULL) libxsmm_free(a_scales);
+  if (b_scales != NULL) libxsmm_free(b_scales);
   for (i = 0; i < n_layers; i++) {
     libxsmm_free(A[i]);
     libxsmm_free(B[i]);
@@ -582,6 +646,9 @@ int main(int argc, char** argv) {
     if (strcmp(argv[12],"F64") == 0) {
       use_dtype = 5;
     }
+    if (strcmp(argv[12],"I8F32") == 0) {
+      use_dtype = 6;
+    }
   }
   if (use_dtype == 1) {
     return gemm_benchmark<libxsmm_bfloat16>(argc, argv);  
@@ -593,6 +660,8 @@ int main(int argc, char** argv) {
     return gemm_benchmark<char>(argc, argv);
   } else if (use_dtype == 5) {
     return gemm_benchmark<double>(argc, argv);
+  } else if (use_dtype == 6) {
+    return gemm_benchmark<char>(argc, argv, true);
   } else {
     return 0;
   }
