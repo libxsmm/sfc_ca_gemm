@@ -66,11 +66,15 @@ $(TARGET): $(SOURCES) $(PREDICTOR_SOURCES) $(HEADERS)
 $(TARGET_ONEDNN): $(SOURCES_ONEDNN) $(HEADERS)
 	$(CXX) $(CXXFLAGS) $(IFLAGS) $(ONEDNN_IFLAGS) $(SOURCES_ONEDNN) $(LFLAGS) $(ONEDNN_LFLAGS) $(LDFLAGS) $(ONEDNN_LDFLAGS) -lxsmm -ldnnl -o $@
 
+# Full oneDNN matmul baseline (no LIBXSMM dependency)
+onednn_matmul_bench: onednn_matmul_bench.cpp
+	$(CXX) $(CXXFLAGS) $(ONEDNN_IFLAGS) onednn_matmul_bench.cpp $(ONEDNN_LFLAGS) $(ONEDNN_LDFLAGS) -ldnnl -o $@
+
 # Standalone model: no LIBXSMM/OpenMP dependency
 $(TARGET_MODEL): sfc_ca_perf_model.cpp sfc_ca_perf_model.hpp sfc_utils.h
 	$(CXX) -std=c++17 -O2 -pthread sfc_ca_perf_model.cpp -o $@
 
 clean:
-	rm -f $(TARGET) $(TARGET_ONEDNN) $(TARGET_MODEL) *.o
+	rm -f $(TARGET) $(TARGET_ONEDNN) $(TARGET_MODEL) onednn_matmul_bench *.o
 
 .PHONY: all clean

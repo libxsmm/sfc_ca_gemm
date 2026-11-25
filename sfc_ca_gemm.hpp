@@ -169,6 +169,11 @@ typedef struct
   libxsmm_gemmfunction brgemm_partial_kernel;   // BRGEMM (BETA_0) into the per-thread scratch tile
   libxsmm_meltwfunction_unary c_copy_kernel;    // first contribution: C = partial
   libxsmm_meltwfunction_binary c_acc_kernel;    // later contributions: C += partial
+  long pf_c_dist;                               // SFC_CA_GEMM_PF_C=d: T1-prefetch the C tile d tasks ahead (0 = off)
+  long pf_c_write;                              // SFC_CA_GEMM_PF_C_HINT=w: PREFETCHW (write intent, to L1) instead of T1
+  long force_beta0;                             // experiment: BETA_0 in every kbf round, no C read-back (results invalid)
+  long round_barrier;                           // experiment: SFC_CA_GEMM_ROUND_BARRIER=1 syncs all threads after each K round
+  long round_major;                             // experiment: SFC_CA_GEMM_ROUND_MAJOR=1 stores A/B as [Kb/brcount][panel][brcount] blocks
 } gemm_config_t;
 
 template <typename DType>
@@ -262,7 +267,17 @@ gemm_config_t *setup_gemm_config(
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
   auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, (unblocked_bc > 0) ? bn : 1, (unblocked_bc > 0) ? M : bm * bn, (unblocked_bc > 0) ? M : bm * bn, dtype_out, dtype_out, dtype_comp);
-  if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
+  config->force_beta0 = (getenv("SFC_CA_GEMM_FORCE_BETA0") && atoi(getenv("SFC_CA_GEMM_FORCE_BETA0")) > 0) ? 1 : 0;
+  if (config->force_beta0) printf("Experiment: BETA_0 BRGEMMs in every K round, no C zeroing (results are invalid)\n");
+  config->round_barrier = (getenv("SFC_CA_GEMM_ROUND_BARRIER") && atoi(getenv("SFC_CA_GEMM_ROUND_BARRIER")) > 0) ? 1 : 0;
+  if (config->round_barrier) printf("Experiment: barrier after every K round (run_gemm only)\n");
+  config->round_major = (getenv("SFC_CA_GEMM_ROUND_MAJOR") && atoi(getenv("SFC_CA_GEMM_ROUND_MAJOR")) > 0) ? 1 : 0;
+  if (config->round_major && (unblocked_bc > 0 || Kb % brcount != 0 || Kb_per_layer % brcount != 0)) {
+    printf("SFC_CA_GEMM_ROUND_MAJOR needs blocked B/C and brcount dividing the per-layer K blocks; disabled\n");
+    config->round_major = 0;
+  }
+  if (config->round_major) printf("Experiment: round-major A/B layout (%ld K blocks per round contiguous across panels)\n", brcount);
+  if (K_rounds_per_layer == 1 || config->force_beta0) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   if (use_nts > 0) l_flags |= LIBXSMM_GEMM_FLAG_ALIGN_C_NTS_HINT;
   config->zero_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_XOR, l_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
@@ -344,6 +359,12 @@ gemm_config_t *setup_gemm_config(
     printf("C reduction: per-tile locks into a single C (%ld partial results per tile, K-layer stagger %s)\n",
            config->c_contributions, config->lock_stagger ? "on" : "off");
   }
+
+  // Experiment: prefetch the C tile of a later task while the current BRGEMM runs (kbf > 1 re-reads C).
+  config->pf_c_dist = (getenv("SFC_CA_GEMM_PF_C") && K_rounds_per_layer > 1) ? std::max(0L, atol(getenv("SFC_CA_GEMM_PF_C"))) : 0;
+  config->pf_c_write = (getenv("SFC_CA_GEMM_PF_C_HINT") && getenv("SFC_CA_GEMM_PF_C_HINT")[0] == 'w') ? 1 : 0;
+  if (config->pf_c_dist > 0)
+    printf("C-tile %s prefetch %ld task(s) ahead (run_gemm only)\n", config->pf_c_write ? "PREFETCHW" : "T1", config->pf_c_dist);
 
   return config;
 }

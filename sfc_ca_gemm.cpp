@@ -90,11 +90,16 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           }
         }
         gemm_param.op.tertiary = (void *)&brcount_use;
-        gemm_param.a.primary = (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
+        // Round-major layout: [Kb/brcount][Mb or Nb][brcount][bk][bm or bn]
+        const long rm_round = (i_k_layer * Kb_per_layer + i_k) / brcount;
+        gemm_param.a.primary = config->round_major ? (void *)((DType *)A + rm_round * M * brcount * bk + i_m * brcount * bk * bm)
+                                                   : (void *)((DType *)A + i_m * K * bm + i_k * bk * bm + i_k_layer * Kb_per_layer * bk * bm);
         if (unblocked_bc == 2) {
           gemm_param.b.primary = (void *)((DType *)config->scratch_B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
         } else if (unblocked_bc == 1) {
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk + i_k_layer * Kb_per_layer * bk);
+        } else if (config->round_major) {
+          gemm_param.b.primary = (void *)((DType *)B + rm_round * N * brcount * bk + i_n * brcount * bk * bn);
         } else {
           gemm_param.b.primary = (void *)((DType *)B + i_n * K * bn + i_k * bk * bn + i_k_layer * Kb_per_layer * bk * bn);
         }
@@ -105,10 +110,26 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
                                                  : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
         }
-        if ((i_k == 0) && (K_rounds_per_layer != 1)){
+        if ((i_k == 0) && (K_rounds_per_layer != 1) && !config->force_beta0){
           libxsmm_meltw_unary_param zero_param;
           zero_param.out.primary = (void*)gemm_param.c.primary;
           zero_kernel( &zero_param );
+        }
+        if (config->pf_c_dist > 0 && i_sfc + config->pf_c_dist < Mb * Nb * K_layers) {
+          const int p_sfc = i_sfc + (int)config->pf_c_dist, p_layer = p_sfc / (Mb * Nb);
+          int p_m, p_n;
+          sfc_ca_gemm_extract_indices_from_sfc(&p_m, &p_n, sfc_index_map, p_sfc % (Mb * Nb), index_tsize);
+          const CType *p_base = (p_layer > 0) ? scratch_C[p_layer - 1] : C;
+          const bool pf_w = config->pf_c_write;
+          auto pf = [pf_w](const char *a) { if (pf_w) _mm_prefetch(a, _MM_HINT_ET0); else _mm_prefetch(a, _MM_HINT_T1); };
+          if (unblocked_bc > 0) {
+            const char *p = (const char *)(p_base + p_n * M * bn + p_m * bm);
+            for (long j = 0; j < bn; j++)
+              for (long b = 0; b < bm * (long)sizeof(CType); b += 64) pf(p + j * M * sizeof(CType) + b);
+          } else {
+            const char *p = (const char *)(p_base + p_n * M * bn + p_m * bn * bm);
+            for (long b = 0; b < bm * bn * (long)sizeof(CType); b += 64) pf(p + b);
+          }
         }
         if (brcount_use > 0) {
           brgemm_kernel( &gemm_param );
@@ -125,6 +146,9 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           eqn_param.output.primary = gemm_param.c.primary;
           config->dequant_kernel(&eqn_param);
         }
+      }
+      if (config->round_barrier) {
+#pragma omp barrier
       }
     }
     if (g_thread_done) g_thread_done[omp_get_thread_num()] = getTime();
@@ -212,6 +236,18 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
                 l_add_kernel(&add_param);
               }
             }
+          } else if (std::is_same<CType, libxsmm_bfloat16>::value && (bm * bn) % 16 == 0) {
+            // Explicit loop: the JIT reduce kernel strides copies by M*N elements and crashes for large C.
+            const long off = i_n * M * bn + i_m * bn * bm;
+            uint16_t *c_ptr = (uint16_t *)((CType *)C + off);
+            for (long e = 0; e < bm * bn; e += 16) {
+              __m512 acc = _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((__m256i *)(c_ptr + e))), 16));
+              for (long k = 0; k < K_layers - 1; k++) {
+                const uint16_t *s = (const uint16_t *)((CType *)scratch_C[k] + off) + e;
+                acc = _mm512_add_ps(acc, _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *)s)), 16)));
+              }
+              _mm256_storeu_si256((__m256i *)(c_ptr + e), (__m256i)_mm512_cvtneps_pbh(acc));
+            }
           } else {
             CType reduce_scratch[bm*bn];
             reduce_param.in.primary = (void*)((CType*)scratch_C[0] + i_n * M * bn + i_m * bn * bm );
@@ -287,8 +323,14 @@ void run_gemm_locked(gemm_config_t *config, DType *A, DType *B, typename output_
         if (brcount_use <= 0) continue;
         libxsmm_gemm_param gemm_param;
         gemm_param.op.tertiary = (void *)&brcount_use;
-        gemm_param.a.primary = (void *)(A + i_m * K * bm + (i_k_layer * Kb_per_layer + i_k) * bk * bm);
-        gemm_param.b.primary = (void *)(B + i_n * K * bn + (i_k_layer * Kb_per_layer + i_k) * bk * bn);
+        if (config->round_major) {
+          const long rm_round = (i_k_layer * Kb_per_layer + i_k) / brcount;
+          gemm_param.a.primary = (void *)(A + rm_round * M * brcount * bk + i_m * brcount * bk * bm);
+          gemm_param.b.primary = (void *)(B + rm_round * config->N * brcount * bk + i_n * brcount * bk * bn);
+        } else {
+          gemm_param.a.primary = (void *)(A + i_m * K * bm + (i_k_layer * Kb_per_layer + i_k) * bk * bm);
+          gemm_param.b.primary = (void *)(B + i_n * K * bn + (i_k_layer * Kb_per_layer + i_k) * bk * bn);
+        }
         gemm_param.c.primary = c_part;
         brgemm_kernel(&gemm_param);
         if constexpr (skip_c_reduction == 0) {
@@ -563,6 +605,19 @@ int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   if (dequant_f32) {
     gemm_cfg->a_scales = (void*)a_scales;
     gemm_cfg->b_scales = (void*)b_scales;
+  }
+  if (gemm_cfg->round_major) {
+    const long brc = gemm_cfg->brcount, blk = bk * bm;
+    DType *tmp = (DType *)libxsmm_aligned_malloc(LIBXSMM_MAX(M, N) * K * sizeof(DType), ALIGNMENT_SIZE);
+    auto repack = [&](DType *buf, long Pb) {
+      memcpy(tmp, buf, Pb * Kb * blk * sizeof(DType));
+#pragma omp parallel for collapse(2)
+      for (long p = 0; p < Pb; p++)
+        for (long kb = 0; kb < Kb; kb++)
+          memcpy(buf + (((kb / brc) * Pb + p) * brc + kb % brc) * blk, tmp + (p * Kb + kb) * blk, blk * sizeof(DType));
+    };
+    for (i = 0; i < n_layers; i++) { repack(A[i], Mb); repack(B[i], Nb); }
+    libxsmm_free(tmp);
   }
 
   // Warmup iteration
