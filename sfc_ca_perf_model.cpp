@@ -31,8 +31,12 @@ static void usage(const char *prog) {
     "                           e.g. \"1:6,2:8,4:10,8:12,16:14,32:16\"\n"
     "  --bw-flat <B/cycle>      per-core Bytes/cycle independent of sharers (instead of --bw)\n"
     "  --c-bw <B/cycle>         per-core Bytes/cycle for C writes/reduction (default bw(1))\n"
+    "  --overlap-c              exclude the final C write-backs from the critical path\n"
+    "                           (C tiles evicted between K rounds and the K_layers reduction still counted)\n"
     "  --macs <MACs/cycle>      BF16 MACs/cycle/core (default 1024)\n"
     "  --eff <percent>          achieved %% of MAC peak inside BRGEMM (default 100)\n"
+    "  --eff-br \"br:P,...\"       achieved %% of MAC peak per BRGEMM brcount (overrides --eff),\n"
+    "                           e.g. \"8:70,16:80,32:90,64:95\"\n"
     "  --freq <GHz>             core frequency, only to report TFLOP/s\n"
     "  --l2-kb <KiB>            per-core fast memory, 0 = infinite (default 2048)\n"
     "  --kl-max <int>           max K_layers (default 16)\n"
@@ -48,16 +52,16 @@ static void usage(const char *prog) {
     "  --jobs <int>             host threads used by the search (default all)\n", prog);
 }
 
-static std::map<long, double> parse_bw(const std::string &s) {
+static std::map<long, double> parse_bw(const std::string &s, const char *opt = "--bw") {
   std::map<long, double> m;
   std::stringstream ss(s);
   std::string item;
   while (std::getline(ss, item, ',')) {
     size_t colon = item.find(':');
-    if (colon == std::string::npos) throw std::runtime_error("bad --bw entry: " + item);
+    if (colon == std::string::npos) throw std::runtime_error(std::string("bad ") + opt + " entry: " + item);
     long sh = std::stol(item.substr(0, colon));
     double bw = std::stod(item.substr(colon + 1));
-    if (sh < 1 || bw <= 0) throw std::runtime_error("bad --bw entry: " + item);
+    if (sh < 1 || bw <= 0) throw std::runtime_error(std::string("bad ") + opt + " entry: " + item);
     m[sh] = bw;
   }
   return m;
@@ -289,6 +293,7 @@ int main(int argc, char **argv) {
     for (int i = 4; i < argc; i++) {
       std::string a = argv[i];
       if (a == "--dump-cores") { dump_cores = true; continue; }
+      if (a == "--overlap-c") { hw.overlap_c_writes = true; continue; }
       if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
       std::string v = argv[++i];
       if (a == "--bm") p.bm = std::stol(v);
@@ -308,6 +313,10 @@ int main(int argc, char **argv) {
       else if (a == "--c-bw") hw.c_bw = std::stod(v);
       else if (a == "--macs") hw.macs_per_cycle = std::stod(v);
       else if (a == "--eff") hw.efficiency = std::stod(v) / 100.0;
+      else if (a == "--eff-br") {
+        hw.eff_by_brcount = parse_bw(v, "--eff-br");
+        for (auto &kv : hw.eff_by_brcount) kv.second /= 100.0;
+      }
       else if (a == "--freq") hw.freq_ghz = std::stod(v);
       else if (a == "--l2-kb") hw.l2_bytes = std::stod(v) * 1024.0;
       else if (a == "--kl-max") sp.kl_max = std::stol(v);
@@ -480,8 +489,13 @@ int main(int argc, char **argv) {
          hw.cbw(), hw.c_bw > 0 ? " (--c-bw)" : " (=BW(1 sharer))",
          hw.sched == OmpSched::Balanced ? "balanced" : "greedy");
   if (hw.freq_ghz > 0) printf("  f=%gGHz", hw.freq_ghz);
+  if (hw.overlap_c_writes) printf("  C-writes=overlapped");
   printf("\nBW(sharers) [B/cyc/core]:");
   for (auto &kv : hw.bw_by_sharers) printf(" %ld:%g", kv.first, kv.second);
+  if (!hw.eff_by_brcount.empty()) {
+    printf("\nEff(brcount) [%%] (overrides eff):");
+    for (auto &kv : hw.eff_by_brcount) printf(" %ld:%g", kv.first, 100.0 * kv.second);
+  }
   printf("\nEvaluated %zu decompositions (K_layers<=%ld, m_step,n_step<=%ld, kbf<=%ld), %zu distinct\n\n",
          n_evaluated, sp.kl_max, sp.step_max, sp.kbf_max, res.size());
 

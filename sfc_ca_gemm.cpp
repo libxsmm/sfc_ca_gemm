@@ -10,6 +10,7 @@
 ******************************************************************************/
 
 #include "sfc_ca_gemm.hpp"
+#include <algorithm>
 
 extern "C" {
   #include "knn_model.h"
@@ -28,6 +29,9 @@ typedef struct
   long n_block;
   long k_layer;
 } thread_work_t;
+
+// Per-thread timestamps of the GEMM loop, recorded only by the SFC_CA_GEMM_LAYER_TIMES pass.
+static double *g_thread_start = NULL, *g_thread_done = NULL;
 
 template<typename DType, int skip_c_reduction = 0>
 void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
@@ -66,6 +70,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
 #pragma omp parallel
   {
     long brcount_use = brcount;
+    if (g_thread_start) g_thread_start[omp_get_thread_num()] = getTime();
     if (tileconfig_kernel != NULL) tileconfig_kernel(NULL);
     for (int i_k = 0; i_k < Kb_per_layer; i_k += brcount){
 #pragma omp for nowait
@@ -122,6 +127,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
         }
       }
     }
+    if (g_thread_done) g_thread_done[omp_get_thread_num()] = getTime();
     if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
   }
   if constexpr (skip_c_reduction == 0) {
@@ -238,10 +244,89 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
   return;
 }
 
+// Lock-based variant (K_layers > 1, blocked B/C): each BRGEMM computes its partial result into a
+// per-thread scratch tile, then adds it into the single C under the tile's lock. The first
+// contribution to a tile overwrites it, so C needs no zeroing and no K_layers copies exist.
+template<typename DType, int skip_c_reduction = 0>
+void run_gemm_locked(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
+  using CType = typename output_type<DType>::type;
+  const long M = config->M, K = config->K, Mb = config->Mb, Nb = config->Nb, Kb = config->Kb;
+  const long bm = config->bm, bn = config->bn, bk = config->bk, K_layers = config->K_layers, brcount = config->brcount;
+  const long Kb_per_layer = (Kb + K_layers - 1) / K_layers;
+  const long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
+  const int contributions = (int)config->c_contributions;
+  unsigned char *sfc_index_map = config->sfc_index_map;
+  const unsigned int index_tsize = config->index_tsize;
+  libxsmm_gemmfunction brgemm_kernel = config->brgemm_partial_kernel;
+  libxsmm_meltwfunction_unary copy_kernel = config->c_copy_kernel;
+  libxsmm_meltwfunction_binary acc_kernel = config->c_acc_kernel;
+  libxsmm_tilecfgfunction tileconfig_kernel = config->tileconfig_kernel;
+  libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
+  c_tile_sync_t *sync = config->c_tile_sync;
+
+#pragma omp parallel
+  {
+    void *c_part = (char *)config->c_partial_scratch + (size_t)omp_get_thread_num() * bm * bn * config->c_comp_size;
+    if (g_thread_start) g_thread_start[omp_get_thread_num()] = getTime();
+    // Same contiguous partition as schedule(static) in libiomp.
+    const long total = Mb * Nb * K_layers, nthr = omp_get_num_threads();
+    const long chunk = (total + nthr - 1) / nthr;
+    const long lo = std::min(total, omp_get_thread_num() * chunk), n = std::min(total, lo + chunk) - lo;
+    // Threads of different K-layers own the same C tiles; rotating each layer's start by n/K_layers
+    // keeps them on different tiles at any moment, without changing which tiles a thread computes.
+    const long rot = (config->lock_stagger && n > 0) ? ((lo / (Mb * Nb)) * n) / K_layers : 0;
+    if (tileconfig_kernel != NULL) tileconfig_kernel(NULL);
+    for (long i_k = 0; i_k < Kb_per_layer; i_k += brcount) {
+      for (long q = 0; q < n; q++) {
+        const long i_sfc = lo + (q + rot) % n;
+        int i_m, i_n;
+        sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, i_sfc % (Mb * Nb), index_tsize);
+        const long i_k_layer = i_sfc / (Mb * Nb);
+        const long kb_layer = (i_k_layer == K_layers - 1) ? Kb_last_layer : Kb_per_layer;
+        long brcount_use = std::min(brcount, kb_layer - i_k);
+        if (brcount_use <= 0) continue;
+        libxsmm_gemm_param gemm_param;
+        gemm_param.op.tertiary = (void *)&brcount_use;
+        gemm_param.a.primary = (void *)(A + i_m * K * bm + (i_k_layer * Kb_per_layer + i_k) * bk * bm);
+        gemm_param.b.primary = (void *)(B + i_n * K * bn + (i_k_layer * Kb_per_layer + i_k) * bk * bn);
+        gemm_param.c.primary = c_part;
+        brgemm_kernel(&gemm_param);
+        if constexpr (skip_c_reduction == 0) {
+          CType *c_tile = C + i_n * M * bn + i_m * bn * bm;
+          c_tile_sync_t *s = &sync[i_n * Mb + i_m];
+          c_tile_lock(s);
+          if (s->count == 0) {
+            libxsmm_meltw_unary_param copy_param;
+            copy_param.in.primary = c_part;
+            copy_param.out.primary = (void *)c_tile;
+            copy_kernel(&copy_param);
+          } else {
+            libxsmm_meltw_binary_param acc_param;
+            acc_param.in0.primary = c_part;
+            acc_param.in1.primary = (void *)c_tile;
+            acc_param.out.primary = (void *)c_tile;
+            acc_kernel(&acc_param);
+          }
+          s->count = (s->count + 1 == contributions) ? 0 : s->count + 1;
+          c_tile_unlock(s);
+        }
+      }
+    }
+    if (g_thread_done) g_thread_done[omp_get_thread_num()] = getTime();
+    if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
+  }
+}
+
+template<typename DType, int skip_c_reduction = 0>
+inline void run_gemm_layer(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
+  if (config->locked_reduction) run_gemm_locked<DType, skip_c_reduction>(config, A, B, C);
+  else run_gemm<DType, skip_c_reduction>(config, A, B, C);
+}
+
 template<typename DType>
 void run_gemm_n_layers(long n_layers, gemm_config_t *config, DType **A, DType **B, typename output_type<DType>::type **C) {
   for (int i = 0; i < n_layers; i++) {
-    run_gemm<DType>(config, A[i], B[i], C[i]);
+    run_gemm_layer<DType>(config, A[i], B[i], C[i]);
   }
   return;
 }
@@ -251,7 +336,7 @@ void run_gemm_n_layers_no_reduction(long n_layers, gemm_config_t *config, DType 
 {
   for (int i = 0; i < n_layers; i++)
   {
-    run_gemm<DType, 1>(config, A[i], B[i], C[i]);
+    run_gemm_layer<DType, 1>(config, A[i], B[i], C[i]);
   }
   return;
 }
@@ -522,11 +607,33 @@ int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   }
 
   // benchmark the GEMM
+  // SFC_CA_GEMM_SKIP_REDUCTION=1 times only the GEMM phase (C is incomplete when K_layers > 1).
+  const bool skip_reduction = getenv("SFC_CA_GEMM_SKIP_REDUCTION") && atoi(getenv("SFC_CA_GEMM_SKIP_REDUCTION")) > 0;
+  if (skip_reduction) printf("SFC_CA_GEMM_SKIP_REDUCTION: timing without the K_layers C reduction\n");
+  const int n_threads = omp_get_max_threads();
+  std::vector<int> cyc_fd(n_threads, -1);
+#pragma omp parallel
+  cyc_fd[omp_get_thread_num()] = open_thread_cycles_counter();
+#ifdef __linux__
+  for (int fd : cyc_fd) if (fd >= 0) { ioctl(fd, PERF_EVENT_IOC_RESET, 0); ioctl(fd, PERF_EVENT_IOC_ENABLE, 0); }
+#endif
   auto t_start = getTime();
   for (long it = 0; it < n_iters; it++) {
-    run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
+    if (skip_reduction) run_gemm_n_layers_no_reduction<DType>(n_layers, gemm_cfg, A, B, C);
+    else run_gemm_n_layers<DType>(n_layers, gemm_cfg, A, B, C);
   }
   auto t_end = getTime();
+  double cyc_sum = 0.0;
+  int n_cyc = 0;
+#ifdef __linux__
+  for (int fd : cyc_fd) {
+    if (fd < 0) continue;
+    ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+    unsigned long long c = 0;
+    if (read(fd, &c, sizeof(c)) == sizeof(c)) { cyc_sum += (double)c; n_cyc++; }
+    close(fd);
+  }
+#endif
 
   // Print performance/model numbers
   double gflop = (2.0*(double)n_layers*(double)M*(double)N*(double)K) / (1000*1000*1000);
@@ -535,6 +642,55 @@ int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   printf("Effective total GEMM sizes: %.5g GB\n", ((double)n_layers * ((double)sizeof(DType) * (double)M * (double)K + (double)sizeof(CType) * (double)M * (double)N + (double)sizeof(DType) * (double)K * (double)N))/(1024.0*1024.0*1024.0));
   printf("Effective A BW is %.5g GB/s\n", (((double)sizeof(DType)*(double)n_layers*(double)M*(double)K) / (1024.0*1024.0*1024.0))/((t_end-t_start)/(1.0*n_iters)));
   printf("MEASURE %.7g SFC_CA_GEMM_%ld_%ld_%ld_%ld_%ld_%ld_bf%ld_replication_%ld_stepM_%ld_stepN_%ld_act_%ld_nts_%ld_threads%d\n", gflop / ((t_end - t_start) / (1.0 * n_iters)), M, N, K, bm, bn, bk, kbf, K_layers, m_step, n_step, unblocked_bc, use_nts, omp_get_max_threads());
+
+  // Peak FLOPs/cycle/core defaults to the generic AMX/AVX-512 rates; override with SFC_CA_GEMM_FLOPS_PER_CYCLE.
+  double flops_per_cycle = std::is_same<DType, libxsmm_bfloat16>::value ? 1024.0 :
+                           (std::is_same<DType, libxsmm_bfloat8>::value || std::is_same<DType, char>::value) ? 2048.0 :
+                           std::is_same<DType, float>::value ? 64.0 : 32.0;
+  if (getenv("SFC_CA_GEMM_FLOPS_PER_CYCLE")) flops_per_cycle = atof(getenv("SFC_CA_GEMM_FLOPS_PER_CYCLE"));
+  // Optional reference % of peak at a fixed nominal frequency (SFC_CA_GEMM_FREQ_GHZ).
+  if (getenv("SFC_CA_GEMM_FREQ_GHZ")) {
+    double freq_ghz = atof(getenv("SFC_CA_GEMM_FREQ_GHZ"));
+    double peak_gflops = (double)omp_get_max_threads() * freq_ghz * flops_per_cycle;
+    printf("Peak is %.7g GFLOPS (%d cores x %.3g GHz x %.0f FLOPs/cycle) -> %.2f%% of peak\n", peak_gflops, omp_get_max_threads(), freq_ghz, flops_per_cycle, 100.0 * (gflop / ((t_end - t_start) / (1.0 * n_iters))) / peak_gflops);
+  }
+  if (n_cyc == n_threads) {
+    // Spin-waiting threads keep counting, so this is the average core clock over the timed loop.
+    double cyc_avg = cyc_sum / n_cyc;
+    double meas_ghz = cyc_avg / (t_end - t_start) / 1e9;
+    double fpc = gflop * 1e9 * (double)n_iters / ((double)n_threads * cyc_avg);
+    printf("Measured freq %.3f GHz -> %.1f FLOPs/cycle/core -> %.2f%% of peak at measured freq\n", meas_ghz, fpc, 100.0 * fpc / flops_per_cycle);
+  } else {
+    printf("Measured freq unavailable (perf_event_open failed on %d/%d threads)\n", n_threads - n_cyc, n_threads);
+  }
+
+  if (getenv("SFC_CA_GEMM_LAYER_TIMES") && atoi(getenv("SFC_CA_GEMM_LAYER_TIMES")) > 0) {
+    std::vector<double> t_st(n_threads), t_dn(n_threads), layer_ms(n_layers, 0.0);
+    double s_fork = 0, s_first = 0, s_med = 0, s_last = 0, s_end = 0;
+    g_thread_start = t_st.data();
+    g_thread_done = t_dn.data();
+    for (long it = 0; it < n_iters; it++) {
+      for (long l = 0; l < n_layers; l++) {
+        double t0 = getTime();
+        run_gemm_layer<DType>(gemm_cfg, A[l], B[l], C[l]);
+        double t1 = getTime();
+        std::sort(t_st.begin(), t_st.end());
+        std::sort(t_dn.begin(), t_dn.end());
+        s_fork  += t_st[n_threads - 1] - t0;
+        s_first += t_dn[0] - t0;
+        s_med   += t_dn[n_threads / 2] - t0;
+        s_last  += t_dn[n_threads - 1] - t0;
+        s_end   += t1 - t0;
+        layer_ms[l] += 1000.0 * (t1 - t0);
+      }
+    }
+    g_thread_start = g_thread_done = NULL;
+    const double n = 1000.0 / (double)(n_iters * n_layers);
+    printf("Layer times [ms]:");
+    for (long l = 0; l < n_layers; l++) printf(" %.3f", layer_ms[l] / (double)n_iters);
+    printf("\nAvg layer [ms]: last thread started %.3f | threads done: first %.3f median %.3f last %.3f | layer end %.3f\n",
+           s_fork * n, s_first * n, s_med * n, s_last * n, s_end * n);
+  }
 
 #ifdef PRINT_THREAD_WORK_ASSIGNMENT
   // We run foo loop to capture work assignment thread_work_t
@@ -620,6 +776,8 @@ int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   {
     libxsmm_free(output_partial_array[0]);
   }
+  if (gemm_cfg->c_tile_sync != NULL) libxsmm_free(gemm_cfg->c_tile_sync);
+  if (gemm_cfg->c_partial_scratch != NULL) libxsmm_free(gemm_cfg->c_partial_scratch);
   free(B);
   free(C);
   free(A);

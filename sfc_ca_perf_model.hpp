@@ -20,7 +20,7 @@
  *  - For every A/B panel the number of threads that read it (its sharers) is
  *    counted; the panel load uses the per-core bandwidth beta(sharers).
  *  - A/B/C reuse is tracked by a per-core LRU cache (or infinite cache).
- *  - Compute rate = MACs/cycle/core * efficiency.
+ *  - Compute rate = MACs/cycle/core * efficiency (optionally a function of the BRGEMM brcount).
  */
 
 #ifndef SFC_CA_PERF_MODEL_HPP
@@ -44,28 +44,33 @@ namespace sfc_model {
 
 enum class OmpSched { Balanced /* libgomp */, Greedy /* libomp/icx */ };
 
+// Log2-linear interpolation between the given points, clamped at the ends.
+inline double interp_log2(const std::map<long, double> &m, long x) {
+  if (x < 1) x = 1;
+  auto hi = m.lower_bound(x);
+  if (hi == m.end()) return std::prev(hi)->second;
+  if (hi->first == x || hi == m.begin()) return hi->second;
+  auto lo = std::prev(hi);
+  double f = (std::log2((double)x) - std::log2((double)lo->first)) /
+             (std::log2((double)hi->first) - std::log2((double)lo->first));
+  return lo->second + f * (hi->second - lo->second);
+}
+
 struct Platform {
   long threads = 64;
   // Per-core B/cycle for loading a panel concurrently read by s cores.
   std::map<long, double> bw_by_sharers;
   double c_bw = 0.0;                 // per-core B/cycle for C traffic, <=0 -> bw(1)
+  bool overlap_c_writes = false;     // final C write-backs hidden behind compute (evictions/reduction still counted)
   double macs_per_cycle = 1024.0;    // per core (BF16)
   double efficiency = 1.0;           // achieved fraction of MAC peak in BRGEMM
+  std::map<long, double> eff_by_brcount;  // fraction of MAC peak per BRGEMM call size; overrides efficiency
   double freq_ghz = 0.0;             // only for reporting
   double l2_bytes = 2.0 * 1024 * 1024; // <=0 -> infinite fast memory
   OmpSched sched = OmpSched::Balanced;
 
-  // Log2-linear interpolation between given sharer counts, clamped at the ends.
-  double bw(long s) const {
-    if (s < 1) s = 1;
-    auto hi = bw_by_sharers.lower_bound(s);
-    if (hi == bw_by_sharers.end()) return std::prev(hi)->second;
-    if (hi->first == s || hi == bw_by_sharers.begin()) return hi->second;
-    auto lo = std::prev(hi);
-    double f = (std::log2((double)s) - std::log2((double)lo->first)) /
-               (std::log2((double)hi->first) - std::log2((double)lo->first));
-    return lo->second + f * (hi->second - lo->second);
-  }
+  double bw(long s) const { return interp_log2(bw_by_sharers, s); }
+  double eff(long brc) const { return eff_by_brcount.empty() ? efficiency : interp_log2(eff_by_brcount, brc); }
   double cbw() const { return (c_bw > 0.0) ? c_bw : bw(1); }
   double peak_flops_per_cycle() const { return 2.0 * macs_per_cycle * (double)threads; }
 };
@@ -295,7 +300,10 @@ inline Result evaluate(const Problem &p, const Platform &hw, const Footprint &fp
   const double a_unit_bytes = (double)p.bm * p.bk * p.in_bytes;   // per K-block of an A panel
   const double b_unit_bytes = (double)p.bn * p.bk * p.in_bytes;
   const double c_tile_bytes = (double)p.bm * p.bn * p.out_bytes;
-  const double unit_compute = (double)p.bm * p.bn * p.bk / (hw.macs_per_cycle * hw.efficiency);
+  // Per-K-block compute cycles of a BRGEMM call with brc blocks.
+  std::vector<double> unit_compute_of(brcount + 1);
+  for (long b = 1; b <= brcount; b++)
+    unit_compute_of[b] = (double)p.bm * p.bn * p.bk / (hw.macs_per_cycle * hw.eff(b));
   const double cbw = hw.cbw();
 
   // Per-core bandwidth lookup by sharer count, cached for the sharer values that occur.
@@ -322,6 +330,7 @@ inline Result evaluate(const Problem &p, const Platform &hw, const Footprint &fp
         long kb_l = ((long)tk.layer == c - 1) ? Kb_last_layer : Kb_per_layer;
         long brc = std::max(0L, std::min(brcount, kb_l - i_k));
         if (brc == 0) continue;
+        const double unit_compute = unit_compute_of[brc];
         bool missA = !cache.access(cache_key(0, rd, tk.layer, tk.im, 0), a_unit_bytes * brc);
         bool missB = !cache.access(cache_key(1, rd, tk.layer, 0, tk.in), b_unit_bytes * brc);
         bool missC = !cache.access(cache_key(2, 0, tk.layer, tk.im, tk.in), c_tile_bytes);
@@ -338,7 +347,8 @@ inline Result evaluate(const Problem &p, const Platform &hw, const Footprint &fp
       }
     }
     // Final C write-back plus read+write for every C tile evicted between K rounds.
-    double c_cyc = ((double)nt + 2.0 * c_rereads) * c_tile_bytes / cbw;
+    double c_xfers = (hw.overlap_c_writes ? 0.0 : (double)nt) + 2.0 * c_rereads;
+    double c_cyc = c_xfers * c_tile_bytes / cbw;
     cyc += c_cyc;
     if (cyc > gemm_max) {
       gemm_max = cyc;

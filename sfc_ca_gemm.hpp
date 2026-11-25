@@ -27,6 +27,12 @@
 #include <cmath>
 #include <omp.h>
 #include <immintrin.h>
+#ifdef __linux__
+#include <linux/perf_event.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include <libxsmm.h>
 #include <libxsmm_utils.h>
 #include "sfc_utils.h"
@@ -72,6 +78,23 @@ inline double getTime() {
   return rdtsc() * ifreq;
 }
 
+// Per-thread core-cycle counter (user mode) of the calling thread; -1 if unavailable.
+inline int open_thread_cycles_counter() {
+#ifdef __linux__
+  struct perf_event_attr pe;
+  memset(&pe, 0, sizeof(pe));
+  pe.type = PERF_TYPE_HARDWARE;
+  pe.size = sizeof(pe);
+  pe.config = PERF_COUNT_HW_CPU_CYCLES;
+  pe.disabled = 1;
+  pe.exclude_kernel = 1;
+  pe.exclude_hv = 1;
+  return (int)syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+#else
+  return -1;
+#endif
+}
+
 // Buffer utilities
 void zero_buf(float* buf, long size) {
   for (long i = 0; i < size; i++) {
@@ -87,6 +110,22 @@ void init_buf(float* buf, long size, long initPos, long initOne)
   for (i = 0; i < size; ++i) {
     buf[i] = (float)((initOne != 0) ? 1.0 : ((initPos != 0) ? drand48() : (0.05 - drand48() / 10.0)));
   }
+}
+
+// Per-C-tile spinlock and contribution counter for the lock-based reduction, one cache line each.
+struct alignas(64) c_tile_sync_t {
+  int lock;
+  int count;
+};
+
+static inline void c_tile_lock(c_tile_sync_t *s) {
+  while (__atomic_exchange_n(&s->lock, 1, __ATOMIC_ACQUIRE)) {
+    while (__atomic_load_n(&s->lock, __ATOMIC_RELAXED)) _mm_pause();
+  }
+}
+
+static inline void c_tile_unlock(c_tile_sync_t *s) {
+  __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE);
 }
 
 // Define struct to store GEMM configuration
@@ -119,6 +158,17 @@ typedef struct
   void *a_scales;                      // per-M scales (size M), applied to A
   void *b_scales;                      // per-N scales (size N), applied to B
   libxsmm_meqn_function dequant_kernel; // TPP equation: out_f32 = (a_scale x b_scale) * i32_acc
+  // Lock-based C reduction (SFC_CA_GEMM_REDUCTION=locks, K_layers > 1): every partial result is
+  // added into the single C under a per-tile lock, so no K_layers C copies and no final reduction.
+  long locked_reduction;
+  long lock_stagger;                            // rotate each K-layer's start within a thread's chunk
+  c_tile_sync_t *c_tile_sync;                   // Mb*Nb locks + contribution counters
+  long c_contributions;                         // partial results per C tile and GEMM call
+  void *c_partial_scratch;                      // per-thread bm*bn tile in the compute type
+  size_t c_comp_size;                           // bytes per compute-type element
+  libxsmm_gemmfunction brgemm_partial_kernel;   // BRGEMM (BETA_0) into the per-thread scratch tile
+  libxsmm_meltwfunction_unary c_copy_kernel;    // first contribution: C = partial
+  libxsmm_meltwfunction_binary c_acc_kernel;    // later contributions: C += partial
 } gemm_config_t;
 
 template <typename DType>
@@ -171,11 +221,17 @@ gemm_config_t *setup_gemm_config(
 
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
+  const char *red_env = getenv("SFC_CA_GEMM_REDUCTION");
+  config->locked_reduction = (K_layers > 1 && red_env != NULL && strcmp(red_env, "locks") == 0) ? 1 : 0;
+  if (config->locked_reduction && (unblocked_bc > 0 || dequant_f32)) {
+    printf("SFC_CA_GEMM_REDUCTION=locks needs blocked B/C and no dequant; using the end-of-GEMM reduction\n");
+    config->locked_reduction = 0;
+  }
   int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
   CType *global_scratch = NULL;
   CType **output_partial_array = (CType**)libxsmm_aligned_malloc(sizeof(CType*) * n_out_copies, ALIGNMENT_SIZE);
   output_partial_array[0] = NULL;
-  if (K_layers > 1)
+  if (K_layers > 1 && !config->locked_reduction)
   {
     size_t scratch_size = (size_t)M * (size_t)N * sizeof(CType) * (size_t)(K_layers - 1);
     global_scratch = (CType *)libxsmm_aligned_malloc(scratch_size, ALIGNMENT_SIZE);
@@ -260,6 +316,33 @@ gemm_config_t *setup_gemm_config(
     auto xform_dtype = (dtype == LIBXSMM_DATATYPE_I8) ? LIBXSMM_DATATYPE_BF8 : dtype;
     auto xform_unary_shape = libxsmm_create_meltw_unary_shape(bk, bn, K, bk, xform_dtype, xform_dtype, xform_dtype);
     config->b_xform_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_IDENTITY, xform_unary_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
+  }
+
+  if (config->locked_reduction) {
+    auto p_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG |
+                   LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_FLAG_BETA_0;
+    auto p_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_comp, dtype_comp);
+    config->brgemm_partial_kernel = libxsmm_dispatch_brgemm(p_shape, p_flags, LIBXSMM_GEMM_PREFETCH_NONE, l_brconfig);
+    config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(p_shape, l_tc_flags);
+    config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(p_shape, l_tr_flags);
+    auto c_copy_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_comp, dtype_out, dtype_comp);
+    config->c_copy_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_IDENTITY, c_copy_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
+    auto c_acc_shape = libxsmm_create_meltw_binary_shape(bm * bn, 1, bm * bn, bm * bn, bm * bn, dtype_comp, dtype_out, dtype_out, dtype_comp);
+    config->c_acc_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, c_acc_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
+    const long Kb_last_layer = Kb - (K_layers - 1) * Kb_per_layer;
+    config->c_contributions = (K_layers - 1) * K_rounds_per_layer + (Kb_last_layer + brcount - 1) / brcount;
+    config->c_tile_sync = (c_tile_sync_t *)libxsmm_aligned_malloc((size_t)Mb * Nb * sizeof(c_tile_sync_t), 64);
+    memset((void *)config->c_tile_sync, 0, (size_t)Mb * Nb * sizeof(c_tile_sync_t));
+    config->c_comp_size = (size_t)LIBXSMM_TYPESIZE(dtype_comp);
+    config->c_partial_scratch = libxsmm_aligned_malloc((size_t)omp_get_max_threads() * bm * bn * config->c_comp_size, 64);
+    const char *stagger_env = getenv("SFC_CA_GEMM_LOCK_STAGGER");
+    config->lock_stagger = (stagger_env == NULL || atoi(stagger_env) != 0) ? 1 : 0;
+    if (!config->brgemm_partial_kernel || !config->c_copy_kernel || !config->c_acc_kernel) {
+      printf("Error: could not dispatch the lock-based reduction kernels\n");
+      exit(1);
+    }
+    printf("C reduction: per-tile locks into a single C (%ld partial results per tile, K-layer stagger %s)\n",
+           config->c_contributions, config->lock_stagger ? "on" : "off");
   }
 
   return config;

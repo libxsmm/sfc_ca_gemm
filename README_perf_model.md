@@ -23,6 +23,8 @@ paper (Sec. III-B, `t_i = max(G*gamma, beta*S_i)`) and of `roofline_predictor.c`
 4. **Cost.**
    - BRGEMM: `brc * max(bm*bn*bk / (MACs/cycle * eff), missA*S_A/beta(sA) + missB*S_B/beta(sB))`
    - C: final write-back per tile, plus write-back + re-read per C tile evicted between rounds
+     (`--overlap-c`: the final write-backs are hidden behind compute; evicted tiles still pay
+     write-back + re-read)
    - Reduction (`K_layers > 1`): `(K_layers + 1)` C tile transfers per reduced tile, split
      over cores as in the kernel's reduction loop
    - Total = slowest core's GEMM phase + slowest core's reduction phase
@@ -49,8 +51,10 @@ make sfc_ca_perf_model            # or: make sfc_ca_perf_model CXX=clang++
 | `--bw "s:B,..."` | per-core Bytes/cycle when a panel has `s` sharers, e.g. `"1:4.8,2:8.8,4:9.6,8:13.2,16:15.9,32:16.7"` |
 | `--bw-flat B` | per-core Bytes/cycle regardless of sharers (instead of `--bw`) |
 | `--c-bw B` | per-core Bytes/cycle for C writes/reduction (default `beta(1)`) |
+| `--overlap-c` | exclude the final C write-backs from the critical path (C tiles evicted between K rounds and the reduction still counted) |
 | `--macs X` | BF16 MACs/cycle/core (1 MAC = 2 flops) |
 | `--eff P` | achieved % of MAC peak inside BRGEMM |
+| `--eff-br "br:P,..."` | achieved % of MAC peak per BRGEMM brcount (overrides `--eff`), e.g. `"8:70,16:80,32:90,64:95"` |
 | `--freq GHz` | only to report TFLOP/s |
 | `--l2-kb KiB` | per-core fast memory, 0 = infinite (default 2048) |
 | `--bm/--bn/--bk` | tile sizes (default 32) |
