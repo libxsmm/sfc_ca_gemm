@@ -35,6 +35,9 @@
 #endif
 #include <libxsmm.h>
 #include <libxsmm_utils.h>
+#include <list>
+#include <stdint.h>
+#include <unordered_map>
 #include "sfc_utils.h"
 #include "sfc_ca_gemm_heuristics.h"
 #include "sfc_ca_gemm_heuristics.h"
@@ -45,6 +48,7 @@
 // Forward declarations
 template<typename DType> libxsmm_datatype sfc_ca_gemm_get_libxsmm_dtype();
 unsigned int sfc_ca_gemm_fill_sfc_index_map(unsigned char **sfc_index_map, unsigned int Mb, unsigned int Nb, unsigned int m_step = 1, unsigned int n_step = 1);
+void sfc_ca_gemm_extract_indices_from_sfc(int *i_m, int *i_n, unsigned char *sfc_index_map, int sfc_index, unsigned int index_tsize);
 
 // Type trait to determine output type (INT32 for INT8 input, same as input otherwise)
 template<typename DType> struct output_type { using type = DType; };
@@ -128,6 +132,23 @@ static inline void c_tile_unlock(c_tile_sync_t *s) {
   __atomic_store_n(&s->lock, 0, __ATOMIC_RELEASE);
 }
 
+// Per-thread plan of the L2-aware prefetching variant (SFC_CA_GEMM_PF=1): which BRGEMMs find both
+// A and B in L2 (predicted with an LRU model of the thread's own task sequence), and the A/B K-slices
+// that will miss, in task order.
+struct pf_item_t {
+  long task;   // flat task index (round * n + q) that loads this slice
+  long off;    // element offset into A (which == 0) or B (which == 1)
+  long bytes;
+  int which;
+};
+
+struct pf_plan_t {
+  long lo = 0, n = 0;
+  std::vector<uint8_t> l2_hit;   // per flat task: A and B both predicted in L2
+  std::vector<pf_item_t> items;
+  long budget = 0;               // prefetch bytes issued per L2-hit BRGEMM
+};
+
 // Define struct to store GEMM configuration
 typedef struct
 {
@@ -161,6 +182,15 @@ typedef struct
   // Lock-based C reduction (SFC_CA_GEMM_REDUCTION=locks, K_layers > 1): every partial result is
   // added into the single C under a per-tile lock, so no K_layers C copies and no final reduction.
   long locked_reduction;
+  long skip_c_zero;                             // experiment: no C writes at all (LIBXSMM_X86_AMX_GEMM_SKIP_C_STORE)
+  long pf_enable;                               // SFC_CA_GEMM_PF=1: L2-aware T1 prefetching (run_gemm_pf)
+  long pf_window;                               // only prefetch slices needed within this many tasks
+  long pf_split;                                // L2-hit BRGEMMs are split into this many calls
+  void *pf_plans;                               // std::vector<pf_plan_t>, one per thread
+  libxsmm_gemmfunction pf_f32_beta0_kernel;     // split pieces: BRGEMM into a stack FP32 tile, first piece
+  libxsmm_gemmfunction pf_f32_beta1_kernel;     // split pieces: later pieces accumulate into the FP32 tile
+  libxsmm_meltwfunction_unary pf_copy_kernel;   // FP32 tile -> C (first K round)
+  libxsmm_meltwfunction_binary pf_acc_kernel;   // C += FP32 tile (later K rounds)
   long lock_stagger;                            // rotate each K-layer's start within a thread's chunk
   c_tile_sync_t *c_tile_sync;                   // Mb*Nb locks + contribution counters
   long c_contributions;                         // partial results per C tile and GEMM call
@@ -170,6 +200,61 @@ typedef struct
   libxsmm_meltwfunction_unary c_copy_kernel;    // first contribution: C = partial
   libxsmm_meltwfunction_binary c_acc_kernel;    // later contributions: C += partial
 } gemm_config_t;
+
+// Builds the per-thread prefetch plans of run_gemm_pf (K_layers = 1, blocked B/C). Each thread replays
+// its own task sequence (same split and order as run_gemm) through an LRU model of its L2.
+inline void sfc_ca_gemm_build_pf_plans(gemm_config_t *cfg, size_t in_bytes, size_t out_bytes) {
+  const long Mb = cfg->Mb, Nb = cfg->Nb, Kb = cfg->Kb, K = cfg->K, bm = cfg->bm, bn = cfg->bn, bk = cfg->bk;
+  const long brcount = cfg->brcount, total = Mb * Nb, rounds = (Kb + brcount - 1) / brcount;
+  const double l2_bytes = 1024.0 * (getenv("SFC_CA_GEMM_PF_L2_KB") ? atof(getenv("SFC_CA_GEMM_PF_L2_KB")) : 2048.0);
+  const double scale = getenv("SFC_CA_GEMM_PF_SCALE") ? atof(getenv("SFC_CA_GEMM_PF_SCALE")) : 1.0;
+  cfg->pf_window = getenv("SFC_CA_GEMM_PF_WINDOW") ? atol(getenv("SFC_CA_GEMM_PF_WINDOW")) : 16;
+  cfg->pf_split = getenv("SFC_CA_GEMM_PF_SPLIT") ? std::max(1L, atol(getenv("SFC_CA_GEMM_PF_SPLIT"))) : 1;
+  std::vector<pf_plan_t> *plans = new std::vector<pf_plan_t>(omp_get_max_threads());
+
+#pragma omp parallel
+  {
+    pf_plan_t &p = (*plans)[omp_get_thread_num()];
+    const long nthr = omp_get_num_threads(), chunk = (total + nthr - 1) / nthr;
+    p.lo = std::min(total, omp_get_thread_num() * chunk);
+    p.n = std::min(total, p.lo + chunk) - p.lo;
+    std::list<std::pair<uint64_t, long>> lru;
+    std::unordered_map<uint64_t, std::list<std::pair<uint64_t, long>>::iterator> idx;
+    double used = 0;
+    auto access = [&](uint64_t key, long sz) {
+      auto it = idx.find(key);
+      if (it != idx.end()) { lru.splice(lru.begin(), lru, it->second); return true; }
+      lru.emplace_front(key, sz);
+      idx[key] = lru.begin();
+      used += sz;
+      while (used > l2_bytes && lru.size() > 1) { used -= lru.back().second; idx.erase(lru.back().first); lru.pop_back(); }
+      return false;
+    };
+    p.l2_hit.assign((size_t)(rounds * p.n), 0);
+    long miss_bytes = 0, hits = 0;
+    for (long t = 0; t < rounds * p.n; t++) {
+      const long rd = t / p.n, i_k = rd * brcount, brc = std::min(brcount, Kb - i_k);
+      int i_m, i_n;
+      sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, cfg->sfc_index_map, (int)(p.lo + t % p.n), cfg->index_tsize);
+      const long a_bytes = brc * bk * bm * (long)in_bytes, b_bytes = brc * bk * bn * (long)in_bytes;
+      const bool hit_a = access(((uint64_t)0 << 60) | ((uint64_t)rd << 32) | (uint64_t)i_m, a_bytes);
+      const bool hit_b = access(((uint64_t)1 << 60) | ((uint64_t)rd << 32) | (uint64_t)i_n, b_bytes);
+      access(((uint64_t)2 << 60) | (uint64_t)(i_n * Mb + i_m), bm * bn * (long)out_bytes);
+      if (!hit_a) { p.items.push_back({t, i_m * K * bm + i_k * bk * bm, a_bytes, 0}); miss_bytes += a_bytes; }
+      if (!hit_b) { p.items.push_back({t, i_n * K * bn + i_k * bk * bn, b_bytes, 1}); miss_bytes += b_bytes; }
+      p.l2_hit[t] = (hit_a && hit_b) ? 1 : 0;
+      hits += p.l2_hit[t];
+    }
+    p.budget = hits ? ((long)(scale * (double)miss_bytes / (double)hits) + 63) / 64 * 64 : 0;
+  }
+  const pf_plan_t &p0 = (*plans)[0];
+  long hits0 = 0, miss0 = 0;
+  for (uint8_t h : p0.l2_hit) hits0 += h;
+  for (const pf_item_t &it : p0.items) miss0 += it.bytes;
+  printf("L2-aware prefetch (thread 0): %ld BRGEMMs, %ld with A+B in L2, %zu missing slices (%.1f MB), %.1f KB T1 per L2-hit BRGEMM, window %ld, split %ld, L2 model %.0f KB\n",
+         (long)p0.l2_hit.size(), hits0, p0.items.size(), miss0 / 1e6, p0.budget / 1024.0, cfg->pf_window, cfg->pf_split, l2_bytes / 1024);
+  cfg->pf_plans = (void *)plans;
+}
 
 template <typename DType>
 gemm_config_t *setup_gemm_config(
@@ -222,10 +307,19 @@ gemm_config_t *setup_gemm_config(
   // Allocate output_partial scratch buffers for K_layers > 1
   using CType = typename output_type<DType>::type;
   const char *red_env = getenv("SFC_CA_GEMM_REDUCTION");
+  const char *skip_store_env = getenv("LIBXSMM_X86_AMX_GEMM_SKIP_C_STORE");
+  config->skip_c_zero = (skip_store_env != NULL && atoi(skip_store_env) != 0) ? 1 : 0;
+  if (config->skip_c_zero) printf("Experiment: BRGEMM C stores and C zeroing disabled (results are invalid)\n");
   config->locked_reduction = (K_layers > 1 && red_env != NULL && strcmp(red_env, "locks") == 0) ? 1 : 0;
   if (config->locked_reduction && (unblocked_bc > 0 || dequant_f32)) {
     printf("SFC_CA_GEMM_REDUCTION=locks needs blocked B/C and no dequant; using the end-of-GEMM reduction\n");
     config->locked_reduction = 0;
+  }
+  const char *pf_env = getenv("SFC_CA_GEMM_PF");
+  config->pf_enable = (pf_env != NULL && atoi(pf_env) > 0) ? 1 : 0;
+  if (config->pf_enable && (K_layers > 1 || unblocked_bc > 0 || dequant_f32)) {
+    printf("SFC_CA_GEMM_PF needs K_layers=1, blocked B/C and no dequant; prefetching disabled\n");
+    config->pf_enable = 0;
   }
   int n_out_copies = LIBXSMM_MAX(1, K_layers - 1);
   CType *global_scratch = NULL;
@@ -260,7 +354,9 @@ gemm_config_t *setup_gemm_config(
   auto l_tr_flags = LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG | LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N');
   auto l_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, (unblocked_bc == 1) ? K : bk, (unblocked_bc > 0) ? M : bm, dtype, dtype, dtype_out, dtype_comp);
   auto l_prefetch_flags = LIBXSMM_GEMM_PREFETCH_NONE;
-  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), brcount);
+  // BR unroll hint is an unsigned char in libxsmm: brcount > 255 wraps (256 -> 0 = rolled loop).
+  const long br_unroll = getenv("SFC_CA_GEMM_BR_UNROLL") ? atol(getenv("SFC_CA_GEMM_BR_UNROLL")) : brcount;
+  auto l_brconfig = libxsmm_create_gemm_batch_reduce_config(LIBXSMM_GEMM_BATCH_REDUCE_STRIDE, bm * bk * sizeof(DType), (unblocked_bc == 1) ? bk * sizeof(DType) : bk * bn * sizeof(DType), (unsigned char)br_unroll);
   auto l_unary_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, (unblocked_bc > 0) ? bn : 1, (unblocked_bc > 0) ? M : bm * bn, (unblocked_bc > 0) ? M : bm * bn, dtype_out, dtype_out, dtype_comp);
   if (K_rounds_per_layer == 1) l_flags |= LIBXSMM_GEMM_FLAG_BETA_0;
   if (use_nts > 0) l_flags |= LIBXSMM_GEMM_FLAG_ALIGN_C_NTS_HINT;
@@ -268,6 +364,27 @@ gemm_config_t *setup_gemm_config(
   config->tileconfig_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tc_flags);
   config->tilerelease_kernel = libxsmm_dispatch_tilecfg_gemm(l_shape, l_tr_flags);
   config->brgemm_kernel = libxsmm_dispatch_brgemm(l_shape, l_flags, l_prefetch_flags, l_brconfig);
+  if (config->pf_enable) {
+    sfc_ca_gemm_build_pf_plans(config, sizeof(DType), sizeof(CType));
+    if (config->pf_split > 1 && (bm != 32 || bn != 32)) {
+      printf("SFC_CA_GEMM_PF_SPLIT needs bm = bn = 32; BRGEMMs are not split\n");
+      config->pf_split = 1;
+    }
+    if (config->pf_split > 1) {
+      auto f_flags = LIBXSMM_GEMM_VNNI_FLAGS('N', 'N', 'V', 'N') | LIBXSMM_GEMM_FLAG_NO_RESET_TILECONFIG | LIBXSMM_GEMM_FLAG_NO_SETUP_TILECONFIG;
+      auto f_shape = libxsmm_create_gemm_shape(bm, bn, bk, bm, bk, bm, dtype, dtype, dtype_comp, dtype_comp);
+      config->pf_f32_beta0_kernel = libxsmm_dispatch_brgemm(f_shape, f_flags | LIBXSMM_GEMM_FLAG_BETA_0, l_prefetch_flags, l_brconfig);
+      config->pf_f32_beta1_kernel = libxsmm_dispatch_brgemm(f_shape, f_flags, l_prefetch_flags, l_brconfig);
+      auto f_copy_shape = libxsmm_create_meltw_unary_shape(bm * bn, 1, bm * bn, bm * bn, dtype_comp, dtype_out, dtype_comp);
+      config->pf_copy_kernel = libxsmm_dispatch_meltw_unary(LIBXSMM_MELTW_TYPE_UNARY_IDENTITY, f_copy_shape, LIBXSMM_MELTW_FLAG_UNARY_NONE);
+      auto f_acc_shape = libxsmm_create_meltw_binary_shape(bm * bn, 1, bm * bn, bm * bn, bm * bn, dtype_comp, dtype_out, dtype_out, dtype_comp);
+      config->pf_acc_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, f_acc_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
+      if (!config->pf_f32_beta0_kernel || !config->pf_f32_beta1_kernel || !config->pf_copy_kernel || !config->pf_acc_kernel) {
+        printf("Error: could not dispatch the split-BRGEMM kernels\n");
+        exit(1);
+      }
+    }
+  }
   auto l_binary_shape = libxsmm_create_meltw_binary_shape(bm, (unblocked_bc == 0) ? bn : ((K_layers > 2) ? 1 : bn), (unblocked_bc > 0) ? M : bm, (unblocked_bc > 0) ? M : bm, (unblocked_bc > 0) ? M : bm, dtype_out, dtype_out, dtype_out, dtype_comp);
   config->l_add_kernel = libxsmm_dispatch_meltw_binary(LIBXSMM_MELTW_TYPE_BINARY_ADD, l_binary_shape, LIBXSMM_MELTW_FLAG_BINARY_NONE);
   auto l_reduce_shape = libxsmm_create_meltw_unary_shape((unblocked_bc > 0) ? bm : bm * bn, n_out_copies, M * N, (unblocked_bc > 0) ? bm : bm * bn, dtype_out, dtype_out, dtype_comp);

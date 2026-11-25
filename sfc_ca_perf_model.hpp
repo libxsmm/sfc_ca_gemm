@@ -62,6 +62,7 @@ struct Platform {
   std::map<long, double> bw_by_sharers;
   double c_bw = 0.0;                 // per-core B/cycle for C traffic, <=0 -> bw(1)
   bool overlap_c_writes = false;     // final C write-backs hidden behind compute (evictions/reduction still counted)
+  bool pf_smooth = false;            // ideal cross-BRGEMM prefetch: memory overlaps any compute of the core
   double macs_per_cycle = 1024.0;    // per core (BF16)
   double efficiency = 1.0;           // achieved fraction of MAC peak in BRGEMM
   std::map<long, double> eff_by_brcount;  // fraction of MAC peak per BRGEMM call size; overrides efficiency
@@ -322,7 +323,7 @@ inline Result evaluate(const Problem &p, const Platform &hw, const Footprint &fp
 
     // Replay every K round of the core's own A/B/C partition through its private cache.
     cache.clear();
-    double comp = 0, stall = 0, cyc = 0, a_bytes = 0, b_bytes = 0, a_cyc = 0, b_cyc = 0;
+    double comp = 0, stall = 0, cyc = 0, mem_total = 0, a_bytes = 0, b_bytes = 0, a_cyc = 0, b_cyc = 0;
     long c_rereads = 0;
     for (long rd = 0; rd < rounds; rd++) {
       const long i_k = rd * brcount;
@@ -339,12 +340,17 @@ inline Result evaluate(const Problem &p, const Platform &hw, const Footprint &fp
         double mem = ua + ub;
         cyc += brc * std::max(unit_compute, mem);
         comp += brc * unit_compute;
+        mem_total += brc * mem;
         stall += brc * std::max(0.0, mem - unit_compute);
         if (missA) { a_bytes += brc * a_unit_bytes; a_cyc += brc * ua; }
         if (missB) { b_bytes += brc * b_unit_bytes; b_cyc += brc * ub; }
         // Round 0 allocates C (zero/BETA_0); a later miss means the partial C was evicted.
         if (rd > 0 && missC) c_rereads++;
       }
+    }
+    if (hw.pf_smooth) {
+      cyc = std::max(comp, mem_total);
+      stall = cyc - comp;
     }
     // Final C write-back plus read+write for every C tile evicted between K rounds.
     double c_xfers = (hw.overlap_c_writes ? 0.0 : (double)nt) + 2.0 * c_rereads;

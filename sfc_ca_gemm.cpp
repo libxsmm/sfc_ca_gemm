@@ -105,7 +105,7 @@ void run_gemm(gemm_config_t *config, DType *A, DType *B, typename output_type<DT
           gemm_param.c.primary = (i_k_layer > 0) ? (void *)((CType *)scratch_C[i_k_layer - 1] + i_n * M * bn + i_m * bn * bm)
                                                  : (void *)((CType *)C + i_n * M * bn + i_m * bn * bm);
         }
-        if ((i_k == 0) && (K_rounds_per_layer != 1)){
+        if ((i_k == 0) && (K_rounds_per_layer != 1) && !config->skip_c_zero){
           libxsmm_meltw_unary_param zero_param;
           zero_param.out.primary = (void*)gemm_param.c.primary;
           zero_kernel( &zero_param );
@@ -317,9 +317,108 @@ void run_gemm_locked(gemm_config_t *config, DType *A, DType *B, typename output_
   }
 }
 
+// L2-aware prefetching variant (SFC_CA_GEMM_PF=1; K_layers = 1, blocked B/C). Same work split and
+// order as run_gemm. Only BRGEMMs whose A and B are both predicted in L2 (per-thread plan) issue T1
+// prefetches, for the next predicted-missing A/B K-slices within pf_window tasks. With pf_split > 1
+// those BRGEMMs run as pieces into a stack FP32 tile with the prefetches spread between them, and
+// C is written once.
+template<typename DType>
+void run_gemm_pf(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
+  using CType = typename output_type<DType>::type;
+  using CompType = typename std::conditional<std::is_same<DType, char>::value, int,
+                   typename std::conditional<std::is_same<DType, double>::value, double, float>::type>::type;
+  const long M = config->M, K = config->K, Kb = config->Kb;
+  const long bm = config->bm, bn = config->bn, bk = config->bk, brcount = config->brcount;
+  const long rounds = (Kb + brcount - 1) / brcount;
+  const long window = config->pf_window, split = config->pf_split;
+  unsigned char *sfc_index_map = config->sfc_index_map;
+  const unsigned int index_tsize = config->index_tsize;
+  libxsmm_gemmfunction brgemm_kernel = config->brgemm_kernel;
+  libxsmm_meltwfunction_unary zero_kernel = config->zero_kernel;
+  libxsmm_tilecfgfunction tileconfig_kernel = config->tileconfig_kernel;
+  libxsmm_tilecfgfunction tilerelease_kernel = config->tilerelease_kernel;
+  const std::vector<pf_plan_t> &plans = *(const std::vector<pf_plan_t> *)config->pf_plans;
+
+#pragma omp parallel
+  {
+    const pf_plan_t &p = plans[omp_get_thread_num()];
+    const long n = p.n, ntasks = rounds * n;
+    alignas(64) CompType c_tile[32 * 32];  // split pieces need bm = bn = 32 (checked at setup)
+    size_t next = 0;    // next predicted-missing slice not fully prefetched yet
+    long next_done = 0; // bytes of it already prefetched
+    // Issue up to `bytes` of T1 prefetches for upcoming missing slices within the window.
+    auto issue = [&](long t, long bytes) {
+      while (bytes > 0 && next < p.items.size() && p.items[next].task - t <= window) {
+        const pf_item_t &it = p.items[next];
+        const long take = std::min(bytes, it.bytes - next_done);
+        const char *base = (const char *)((it.which == 0 ? A : B) + it.off) + next_done;
+        for (long off = 0; off < take; off += 64) _mm_prefetch(base + off, _MM_HINT_T1);
+        next_done += take;
+        bytes -= take;
+        if (next_done >= it.bytes) { next++; next_done = 0; }
+      }
+    };
+    if (g_thread_start) g_thread_start[omp_get_thread_num()] = getTime();
+    if (tileconfig_kernel != NULL) tileconfig_kernel(NULL);
+    for (long t = 0; t < ntasks; t++) {
+      while (next < p.items.size() && p.items[next].task <= t) { next++; next_done = 0; }
+      const long i_k = (t / n) * brcount, brc = std::min(brcount, Kb - i_k);
+      int i_m, i_n;
+      sfc_ca_gemm_extract_indices_from_sfc(&i_m, &i_n, sfc_index_map, (int)(p.lo + t % n), index_tsize);
+      DType *a_ptr = A + i_m * K * bm + i_k * bk * bm;
+      DType *b_ptr = B + i_n * K * bn + i_k * bk * bn;
+      CType *c_ptr = C + i_n * M * bn + i_m * bn * bm;
+      const bool pf_here = p.l2_hit[t] && p.budget > 0;
+      const long pieces = pf_here ? std::min(split, brc) : 1;
+      if (pieces == 1) {
+        if (pf_here) issue(t, p.budget);
+        if (i_k == 0 && rounds != 1 && !config->skip_c_zero) {
+          libxsmm_meltw_unary_param zero_param;
+          zero_param.out.primary = (void *)c_ptr;
+          zero_kernel(&zero_param);
+        }
+        long brcount_use = brc;
+        libxsmm_gemm_param gemm_param;
+        gemm_param.op.tertiary = (void *)&brcount_use;
+        gemm_param.a.primary = (void *)a_ptr;
+        gemm_param.b.primary = (void *)b_ptr;
+        gemm_param.c.primary = (void *)c_ptr;
+        brgemm_kernel(&gemm_param);
+        continue;
+      }
+      for (long c = 0; c < pieces; c++) {
+        const long b0 = brc * c / pieces, b1 = brc * (c + 1) / pieces;
+        issue(t, p.budget / pieces);
+        long brcount_use = b1 - b0;
+        libxsmm_gemm_param gemm_param;
+        gemm_param.op.tertiary = (void *)&brcount_use;
+        gemm_param.a.primary = (void *)(a_ptr + b0 * bk * bm);
+        gemm_param.b.primary = (void *)(b_ptr + b0 * bk * bn);
+        gemm_param.c.primary = (void *)c_tile;
+        (c == 0 ? config->pf_f32_beta0_kernel : config->pf_f32_beta1_kernel)(&gemm_param);
+      }
+      if (i_k == 0) {
+        libxsmm_meltw_unary_param copy_param;
+        copy_param.in.primary = (void *)c_tile;
+        copy_param.out.primary = (void *)c_ptr;
+        config->pf_copy_kernel(&copy_param);
+      } else {
+        libxsmm_meltw_binary_param acc_param;
+        acc_param.in0.primary = (void *)c_tile;
+        acc_param.in1.primary = (void *)c_ptr;
+        acc_param.out.primary = (void *)c_ptr;
+        config->pf_acc_kernel(&acc_param);
+      }
+    }
+    if (g_thread_done) g_thread_done[omp_get_thread_num()] = getTime();
+    if (tilerelease_kernel != NULL) tilerelease_kernel(NULL);
+  }
+}
+
 template<typename DType, int skip_c_reduction = 0>
 inline void run_gemm_layer(gemm_config_t *config, DType *A, DType *B, typename output_type<DType>::type *C) {
   if (config->locked_reduction) run_gemm_locked<DType, skip_c_reduction>(config, A, B, C);
+  else if (config->pf_enable) run_gemm_pf<DType>(config, A, B, C);
   else run_gemm<DType, skip_c_reduction>(config, A, B, C);
 }
 
@@ -778,6 +877,7 @@ int gemm_benchmark(int argc, char** argv, bool dequant_f32 = false) {
   }
   if (gemm_cfg->c_tile_sync != NULL) libxsmm_free(gemm_cfg->c_tile_sync);
   if (gemm_cfg->c_partial_scratch != NULL) libxsmm_free(gemm_cfg->c_partial_scratch);
+  delete (std::vector<pf_plan_t> *)gemm_cfg->pf_plans;
   free(B);
   free(C);
   free(A);

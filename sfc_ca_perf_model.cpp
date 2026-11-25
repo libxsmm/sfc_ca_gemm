@@ -33,6 +33,8 @@ static void usage(const char *prog) {
     "  --c-bw <B/cycle>         per-core Bytes/cycle for C writes/reduction (default bw(1))\n"
     "  --overlap-c              exclude the final C write-backs from the critical path\n"
     "                           (C tiles evicted between K rounds and the K_layers reduction still counted)\n"
+    "  --pf-smooth              ideal cross-BRGEMM prefetch: A/B loads overlap any compute of the core\n"
+    "                           (time = max(total compute, total A/B load) instead of per-BRGEMM max)\n"
     "  --macs <MACs/cycle>      BF16 MACs/cycle/core (default 1024)\n"
     "  --eff <percent>          achieved %% of MAC peak inside BRGEMM (default 100)\n"
     "  --eff-br \"br:P,...\"       achieved %% of MAC peak per BRGEMM brcount (overrides --eff),\n"
@@ -294,6 +296,7 @@ int main(int argc, char **argv) {
       std::string a = argv[i];
       if (a == "--dump-cores") { dump_cores = true; continue; }
       if (a == "--overlap-c") { hw.overlap_c_writes = true; continue; }
+      if (a == "--pf-smooth") { hw.pf_smooth = true; continue; }
       if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
       std::string v = argv[++i];
       if (a == "--bm") p.bm = std::stol(v);
@@ -490,6 +493,7 @@ int main(int argc, char **argv) {
          hw.sched == OmpSched::Balanced ? "balanced" : "greedy");
   if (hw.freq_ghz > 0) printf("  f=%gGHz", hw.freq_ghz);
   if (hw.overlap_c_writes) printf("  C-writes=overlapped");
+  if (hw.pf_smooth) printf("  A/B-prefetch=ideal");
   printf("\nBW(sharers) [B/cyc/core]:");
   for (auto &kv : hw.bw_by_sharers) printf(" %ld:%g", kv.first, kv.second);
   if (!hw.eff_by_brcount.empty()) {
